@@ -38,7 +38,8 @@ Write-Host ""
 Write-Host "Building executable..." -ForegroundColor Yellow
 
 # Build the executable
-python -m PyInstaller --onefile --windowed --name MatchResolution --distpath dist --workpath build --specpath build MatchResolution.py
+$exeName = "MatchResolution_V$version"
+python -m PyInstaller --onefile --windowed --name $exeName --distpath dist --workpath build --specpath build MatchResolution.py
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Build failed" -ForegroundColor Red
@@ -52,15 +53,15 @@ Write-Host "================================================" -ForegroundColor G
 Write-Host ""
 
 # Verify output
-if (Test-Path "dist\MatchResolution.exe") {
-    $exeSize = (Get-Item "dist\MatchResolution.exe").Length / 1MB
+if (Test-Path "dist\$exeName.exe") {
+    $exeSize = (Get-Item "dist\$exeName.exe").Length / 1MB
     Write-Host "Executable created successfully" -ForegroundColor Green
-    Write-Host "Location: dist\MatchResolution.exe" -ForegroundColor Cyan
+    Write-Host "Location: dist\$exeName.exe" -ForegroundColor Cyan
     Write-Host "Size: $([Math]::Round($exeSize, 2)) MB" -ForegroundColor Cyan
     Write-Host "Version: $version" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "Next steps:" -ForegroundColor Yellow
-    Write-Host "1. Test the executable: .\dist\MatchResolution.exe" -ForegroundColor Cyan
+    Write-Host "1. Test the executable: .\dist\$exeName.exe" -ForegroundColor Cyan
     Write-Host "2. Verify functionality" -ForegroundColor Cyan
     Write-Host "3. Check RELEASE_CHECKLIST.md" -ForegroundColor Cyan
 }
