@@ -9,6 +9,7 @@ from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex
 from PySide6.QtGui import QColor, QBrush, QFont, QDoubleValidator
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QComboBox,
     QMainWindow,
     QWidget,
@@ -24,6 +25,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QHeaderView,
     QTabWidget,
+    QRadioButton,
     QScrollArea,
     QSplitter,
 )
@@ -57,7 +59,7 @@ REQUIRED_TABLE_COLUMNS = ["Frequency", "CMD", *EXPECTED_S_COLUMNS]
 XY_PARAMETERS = ["S11", "S21", "S12", "S22"]
 IMPEDANCE_PARAMETERS = ["S11", "S22"]
 DEFAULT_Z0 = 50.0
-APP_VERSION = "V1.0.2"
+APP_VERSION = "V1.0.3"
 
 
 def is_float_text(text: str) -> bool:
@@ -542,6 +544,101 @@ def build_delta_impedance_plot_data(df, z0=DEFAULT_Z0):
     return horizontal, vertical, x_values, y_values
 
 
+def build_reflection_coefficient_matrix(df, parameter_name):
+    real_col = f"{parameter_name}_r"
+    imag_col = f"{parameter_name}_x"
+
+    if real_col not in df.columns or imag_col not in df.columns:
+        raise ValueError(f"Missing columns for {parameter_name}.")
+
+    x_max = int(df["X_C1"].max())
+    y_max = int(df["Y_C2"].max())
+    x_values = list(range(x_max + 1))
+    y_values = list(range(y_max + 1))
+
+    if not x_values or not y_values:
+        raise ValueError("Reflect coefficient table is empty.")
+
+    x_lookup = {value: index for index, value in enumerate(x_values)}
+    y_lookup = {value: index for index, value in enumerate(y_values)}
+
+    matrix = np.full((len(y_values), len(x_values)), np.nan, dtype=float)
+
+    for row in df[["X_C1", "Y_C2", real_col, imag_col]].itertuples(index=False):
+        x_pos = int(row[0])
+        y_pos = int(row[1])
+        real_value = row[2]
+        imag_value = row[3]
+        if pd.isna(real_value) or pd.isna(imag_value):
+            continue
+        matrix[y_lookup[y_pos]][x_lookup[x_pos]] = abs(complex(real_value, imag_value))
+
+    return matrix, x_values, y_values
+
+
+def build_delta_reflection_plot_data(df, parameter_name):
+    """Return horizontal and vertical ΔΓ grids for plotting (current - previous)."""
+    matrix, x_values, y_values = build_reflection_coefficient_matrix(df, parameter_name)
+
+    horizontal = np.full(matrix.shape, np.nan, dtype=float)
+    vertical = np.full(matrix.shape, np.nan, dtype=float)
+
+    horizontal[:, 0] = 0.0
+    for row_index in range(len(y_values)):
+        for col_index in range(1, len(x_values)):
+            current = matrix[row_index, col_index]
+            previous = matrix[row_index, col_index - 1]
+            if np.isnan(current) or np.isnan(previous):
+                continue
+            horizontal[row_index, col_index] = current - previous
+
+    vertical[0, :] = 0.0
+    for row_index in range(1, len(y_values)):
+        for col_index in range(len(x_values)):
+            current = matrix[row_index, col_index]
+            previous = matrix[row_index - 1, col_index]
+            if np.isnan(current) or np.isnan(previous):
+                continue
+            vertical[row_index, col_index] = current - previous
+
+    return horizontal, vertical, x_values, y_values
+
+
+def build_reflection_display_table(df, parameter_name, orientation):
+    if orientation not in ("horizontal", "vertical"):
+        raise ValueError(f"Unknown reflection orientation: {orientation}")
+
+    horizontal, vertical, x_values, y_values = build_delta_reflection_plot_data(df, parameter_name)
+    delta_matrix = horizontal if orientation == "horizontal" else vertical
+    x_denominator = max(x_values) if max(x_values) > 0 else 1
+    y_denominator = max(y_values) if max(y_values) > 0 else 1
+
+    presentation_rows = []
+    presentation_rows.append(["", "", "c1 coarse"] + [str(x // 64) for x in x_values])
+    presentation_rows.append(["", f"ΔΓ({parameter_name} {orientation})", "c1 fine"] + [str(x % 64) for x in x_values])
+    presentation_rows.append(["C2 coarse", "c2 fine", "percentage"] + [f"{(x / x_denominator) * 100:.2f}%" for x in x_values])
+
+    for y_index, y_value in enumerate(y_values):
+        grid_row = []
+        for value in delta_matrix[y_index]:
+            if np.isnan(value):
+                grid_row.append("")
+            elif abs(value) < 1e-12:
+                grid_row.append("0")
+            else:
+                grid_row.append(f"{value:.6g}")
+        presentation_rows.append(
+            [
+                str(y_value // 64),
+                str(y_value % 64),
+                f"{(y_value / y_denominator) * 100:.2f}%",
+                *grid_row,
+            ]
+        )
+
+    return pd.DataFrame(presentation_rows)
+
+
 def build_smith_chart_plot_data(df, parameter_name):
     real_col = f"{parameter_name}_r"
     imag_col = f"{parameter_name}_x"
@@ -565,6 +662,48 @@ def build_smith_chart_plot_data(df, parameter_name):
         })
 
     return points
+
+
+def build_smith_dz_lookup(df, z0=DEFAULT_Z0):
+    """
+    Build a lookup table for Smith-chart dZ coloring.
+    Value is max(horizontal |ΔZ|, vertical |ΔZ|) at each X/Y point.
+    """
+    horizontal, vertical, x_values, y_values = build_delta_impedance_plot_data(df, z0)
+    dz_lookup = {}
+
+    for y_index, y_value in enumerate(y_values):
+        for x_index, x_value in enumerate(x_values):
+            candidates = []
+            h_value = horizontal[y_index, x_index]
+            v_value = vertical[y_index, x_index]
+            if np.isfinite(h_value):
+                candidates.append(float(h_value))
+            if np.isfinite(v_value):
+                candidates.append(float(v_value))
+            if not candidates:
+                continue
+            dz_lookup[(int(x_value), int(y_value))] = max(candidates)
+
+    return dz_lookup
+
+
+def build_smith_dgamma_lookup(df, parameter_name, orientation):
+    """
+    Build a lookup table for Smith-chart dΓ coloring using delta-Γ resolution.
+    """
+    horizontal, vertical, x_values, y_values = build_delta_reflection_plot_data(df, parameter_name)
+    delta_matrix = horizontal if orientation == "horizontal" else vertical
+
+    dgamma_lookup = {}
+    for y_index, y_value in enumerate(y_values):
+        for x_index, x_value in enumerate(x_values):
+            value = delta_matrix[y_index, x_index]
+            if not np.isfinite(value):
+                continue
+            dgamma_lookup[(int(x_value), int(y_value))] = abs(float(value))
+
+    return dgamma_lookup
 
 
 def draw_smith_chart_grid(ax):
@@ -812,12 +951,18 @@ class MatchResolutionGui(QMainWindow):
         self.current_impedance_parameter = "S11"
         self.df_dz_display = None
         self.current_dz_parameter = "S22 horizontal"
+        self.df_reflection_display = None
+        self.current_reflection_parameter = "S22"
+        self.current_reflection_mode = "horizontal"
         self.df_smith_points = None
         self.current_smith_parameter = "S22"
         self.smith_plot_points = []
         self.smith_plot_values = np.array([], dtype=complex)
         self.smith_scatter = None
         self.smith_conjugate_enabled = False
+        self.current_smith_mode = "xy"
+        self.smith_dz_lookup = {}
+        self.smith_dgamma_lookup = {}
 
         self.init_ui()
 
@@ -1198,11 +1343,13 @@ class MatchResolutionGui(QMainWindow):
         self.dz_good_edit = QLineEdit("0.0001")
         self.dz_good_edit.setFixedWidth(90)
         self.dz_good_edit.setValidator(QDoubleValidator(0.0, 1e12, 6))
+        self.dz_good_edit.editingFinished.connect(self._on_dz_threshold_changed)
         dz_plot_controls.addWidget(self.dz_good_edit)
         dz_plot_controls.addWidget(QLabel("Poor |ΔZ| ≥"))
         self.dz_poor_edit = QLineEdit("0.1")
         self.dz_poor_edit.setFixedWidth(90)
         self.dz_poor_edit.setValidator(QDoubleValidator(0.0, 1e12, 6))
+        self.dz_poor_edit.editingFinished.connect(self._on_dz_threshold_changed)
         dz_plot_controls.addWidget(self.dz_poor_edit)
 
         self.dz_plot_button = QPushButton("Plot")
@@ -1291,9 +1438,40 @@ class MatchResolutionGui(QMainWindow):
         """)
         smith_toolbar_layout.addWidget(self.smith_hover_label, stretch=1)
 
+        smith_mode_frame = QFrame()
+        smith_mode_frame.setStyleSheet("""
+            QFrame {
+                background-color: #FAFAFA;
+                border: 1px solid #CFD8DC;
+                border-radius: 10px;
+                padding: 8px;
+            }
+        """)
+        smith_mode_layout = QHBoxLayout(smith_mode_frame)
+        self.smith_mode_group = QButtonGroup(self)
+        self.smith_mode_xy_radio = QRadioButton("X-Y Table")
+        self.smith_mode_dz_radio = QRadioButton("dZ")
+        self.smith_mode_dgamma_radio = QRadioButton("dΓ")
+        self.smith_mode_dvswr_radio = QRadioButton("dVSWR")
+
+        for mode, radio_button in (
+            ("xy", self.smith_mode_xy_radio),
+            ("dz", self.smith_mode_dz_radio),
+            ("dgamma", self.smith_mode_dgamma_radio),
+            ("dvswr", self.smith_mode_dvswr_radio),
+        ):
+            radio_button.setStyleSheet("QRadioButton { color: #D32F2F; font-size: 14px; }")
+            self.smith_mode_group.addButton(radio_button)
+            radio_button.toggled.connect(lambda checked, selected_mode=mode: self._on_smith_mode_changed(selected_mode, checked))
+            smith_mode_layout.addWidget(radio_button)
+
+        self.smith_mode_xy_radio.setChecked(True)
+        smith_mode_layout.addStretch(1)
+
         self.smith_tab = QWidget()
         smith_layout = QVBoxLayout(self.smith_tab)
         smith_layout.addWidget(smith_toolbar)
+        smith_layout.addWidget(smith_mode_frame)
 
         if _MATPLOTLIB_OK:
             self.smith_figure = Figure(figsize=(8, 8))
@@ -1307,7 +1485,129 @@ class MatchResolutionGui(QMainWindow):
         self.tabs.addTab(self.smith_tab, "Smith Chart")
 
         self.component_tab = self._build_component_tab()
-        self.reflection_tab = self.build_tab_page("Reflect Coefficient", self.placeholder_text("Reflect Coefficient"))
+
+        reflection_toolbar = QFrame()
+        reflection_toolbar.setStyleSheet("""
+            QFrame {
+                background-color: #E0F7FA;
+                border-radius: 10px;
+                padding: 8px;
+            }
+        """)
+        reflection_toolbar_layout = QHBoxLayout(reflection_toolbar)
+
+        reflection_toolbar_layout.addWidget(QLabel("Parameter:"))
+        self.reflection_parameter_combo = QComboBox()
+        self.reflection_parameter_combo.addItems(XY_PARAMETERS)
+        self.reflection_parameter_combo.setCurrentText("S22")
+        self.reflection_parameter_combo.currentTextChanged.connect(self.refresh_reflection_table)
+        reflection_toolbar_layout.addWidget(self.reflection_parameter_combo)
+
+        reflection_toolbar_layout.addWidget(QLabel("Mode:"))
+        self.reflection_mode_combo = QComboBox()
+        self.reflection_mode_combo.addItems(["horizontal", "vertical"])
+        self.reflection_mode_combo.setCurrentText("horizontal")
+        self.reflection_mode_combo.currentTextChanged.connect(self.refresh_reflection_table)
+        reflection_toolbar_layout.addWidget(self.reflection_mode_combo)
+
+        reflection_toolbar_layout.addWidget(QLabel("Reflect coefficient resolution: cell[n] = value[n] - value[n-1]."))
+        self.reflection_cell_label = QLabel("Click a cell to see the value here.")
+        self.reflection_cell_label.setStyleSheet("""
+            QLabel {
+                color: #006064;
+                background-color: #E0F2F1;
+                border: 1px solid #26A69A;
+                border-radius: 8px;
+                padding: 6px 10px;
+                font-weight: bold;
+            }
+        """)
+        reflection_toolbar_layout.addWidget(self.reflection_cell_label, stretch=1)
+        reflection_toolbar_layout.addStretch(1)
+
+        self.reflection_table_view = QTableView()
+        self.reflection_table_view.setAlternatingRowColors(False)
+        self.reflection_table_view.setMinimumHeight(240)
+        self.reflection_table_view.setStyleSheet("""
+            QTableView {
+                background-color: white;
+                gridline-color: #90A4AE;
+                font-size: 12px;
+            }
+            QHeaderView::section {
+                background-color: #00838F;
+                color: white;
+                padding: 4px;
+                border: 1px solid #0097A7;
+                font-weight: bold;
+            }
+        """)
+        self.reflection_table_page = self.create_table_page(self.reflection_table_view, reflection_toolbar)
+
+        reflection_plot_frame = QFrame()
+        reflection_plot_frame.setStyleSheet("""
+            QFrame {
+                background-color: #E0F7FA;
+                border: 1px solid #80DEEA;
+                border-radius: 10px;
+            }
+        """)
+        reflection_plot_layout = QVBoxLayout(reflection_plot_frame)
+        reflection_plot_layout.setContentsMargins(12, 12, 12, 12)
+
+        reflection_plot_controls = QHBoxLayout()
+        reflection_plot_controls.addWidget(QLabel("Good |ΔΓ| ≤"))
+        self.reflection_good_edit = QLineEdit("0.1")
+        self.reflection_good_edit.setFixedWidth(90)
+        self.reflection_good_edit.setValidator(QDoubleValidator(0.0, 1e12, 6))
+        self.reflection_good_edit.editingFinished.connect(self._on_reflection_threshold_changed)
+        reflection_plot_controls.addWidget(self.reflection_good_edit)
+        reflection_plot_controls.addWidget(QLabel("Poor |ΔΓ| ≥"))
+        self.reflection_poor_edit = QLineEdit("0.9")
+        self.reflection_poor_edit.setFixedWidth(90)
+        self.reflection_poor_edit.setValidator(QDoubleValidator(0.0, 1e12, 6))
+        self.reflection_poor_edit.editingFinished.connect(self._on_reflection_threshold_changed)
+        reflection_plot_controls.addWidget(self.reflection_poor_edit)
+
+        self.reflection_plot_button = QPushButton("Plot")
+        self.reflection_plot_button.setMinimumHeight(34)
+        self.reflection_plot_button.setStyleSheet("""
+            QPushButton {
+                background-color: #00838F;
+                color: white;
+                border-radius: 8px;
+                padding: 6px 24px;
+                font-size: 14px;
+                font-weight: bold;
+            }
+            QPushButton:hover { background-color: #006064; }
+            QPushButton:pressed { background-color: #004D40; }
+        """)
+        self.reflection_plot_button.clicked.connect(self.plot_reflection_resolution)
+        reflection_plot_controls.addWidget(self.reflection_plot_button)
+        reflection_plot_controls.addStretch(1)
+        reflection_plot_layout.addLayout(reflection_plot_controls)
+
+        self.reflection_status_label = QLabel("Press Plot to render delta reflect-coefficient map.")
+        self.reflection_status_label.setStyleSheet("font-size: 13px; color: #006064; padding: 4px;")
+        reflection_plot_layout.addWidget(self.reflection_status_label)
+
+        if _MATPLOTLIB_OK:
+            self.reflection_figure = Figure(figsize=(8, 6))
+            self.reflection_canvas = FigureCanvas(self.reflection_figure)
+            self.reflection_canvas.setMinimumHeight(320)
+            reflection_plot_layout.addWidget(self.reflection_canvas)
+        else:
+            reflection_plot_layout.addWidget(QLabel("matplotlib is not installed.\nRun: pip install matplotlib"))
+
+        self.reflection_tab = QWidget()
+        reflection_layout = QVBoxLayout(self.reflection_tab)
+        self.reflection_splitter = QSplitter(Qt.Vertical)
+        self.reflection_splitter.addWidget(self.reflection_table_page)
+        self.reflection_splitter.addWidget(reflection_plot_frame)
+        self.reflection_splitter.setSizes([520, 220])
+        reflection_layout.addWidget(self.reflection_splitter)
+
         self.vswr_tab = self.build_tab_page("VSWR", self.placeholder_text("VSWR"))
 
         self.tabs.addTab(self.component_tab, "Component")
@@ -1317,7 +1617,7 @@ class MatchResolutionGui(QMainWindow):
         main_layout.addWidget(self.tabs, stretch=1)
 
         note = QLabel(
-            "Note: Display tab shows the converted row table. X-Y Table shows the grid view for the selected S-parameter. dZ shows delta impedance for S22. Smith Chart plots the selected X-Y data."
+            "Note: Display tab shows the converted row table. X-Y Table shows the grid view for the selected S-parameter. dZ shows delta impedance for S22. Reflect Coefficient tab shows delta-Γ resolution from X-Y data. Smith Chart supports X-Y Table, dZ, and dΓ coloring; dVSWR is under construction."
         )
         note.setAlignment(Qt.AlignCenter)
         note.setStyleSheet("font-size: 13px; color: #607D8B; padding: 6px;")
@@ -1791,18 +2091,235 @@ class MatchResolutionGui(QMainWindow):
         else:
             self.impedance_cell_label.setText(f"Row {row + 1}, Col {column + 1}: {value}")
 
+    def refresh_reflection_table(self):
+        if self.df_all is None or self.df_all.empty:
+            return
+
+        self.current_reflection_parameter = self.reflection_parameter_combo.currentText().strip()
+        self.current_reflection_mode = self.reflection_mode_combo.currentText().strip()
+        self.df_reflection_display = build_reflection_display_table(
+            self.df_all,
+            self.current_reflection_parameter,
+            self.current_reflection_mode,
+        )
+
+        self.reflection_table_model = PandasTableModel(self.df_reflection_display)
+        self.reflection_table_view.setModel(self.reflection_table_model)
+        self.reflection_table_view.horizontalHeader().setVisible(False)
+        self.reflection_table_view.verticalHeader().setVisible(False)
+        self.reflection_table_view.horizontalHeader().setSectionResizeMode(QHeaderView.Fixed)
+        self.reflection_table_view.horizontalHeader().setDefaultSectionSize(80)
+        self.reflection_table_view.verticalHeader().setDefaultSectionSize(24)
+        self.reflection_table_view.setSelectionBehavior(QTableView.SelectItems)
+        self.reflection_table_view.setSelectionMode(QTableView.SingleSelection)
+        selection_model = self.reflection_table_view.selectionModel()
+        if selection_model is not None:
+            selection_model.currentChanged.connect(self.update_reflection_cell_label)
+        self.reflection_cell_label.setText("Click a cell to see the value here.")
+        if _MATPLOTLIB_OK:
+            self.plot_reflection_resolution(show_message_on_error=False)
+        if self.current_smith_mode == "dgamma" and self.df_all is not None and not self.df_all.empty:
+            self.refresh_smith_chart()
+
+    def update_reflection_cell_label(self, current, previous):
+        if not current.isValid() or self.df_reflection_display is None:
+            self.reflection_cell_label.setText("Click a cell to see the value here.")
+            return
+
+        row = current.row()
+        column = current.column()
+        if row >= len(self.df_reflection_display.index) or column >= len(self.df_reflection_display.columns):
+            self.reflection_cell_label.setText("Click a cell to see the value here.")
+            return
+
+        value = self.df_reflection_display.iat[row, column]
+        if value == "":
+            self.reflection_cell_label.setText(f"Row {row + 1}, Col {column + 1}: empty")
+        else:
+            self.reflection_cell_label.setText(f"Row {row + 1}, Col {column + 1}: {value}")
+
+    def _on_reflection_threshold_changed(self):
+        if self.df_all is not None and not self.df_all.empty:
+            self.plot_reflection_resolution(show_message_on_error=False)
+            if self.current_smith_mode == "dgamma":
+                self.refresh_smith_chart()
+
+    def _get_reflection_thresholds(self, show_message=False):
+        try:
+            good_threshold = float(self.reflection_good_edit.text().strip() or "0")
+            poor_threshold = float(self.reflection_poor_edit.text().strip() or "0")
+        except ValueError:
+            if show_message:
+                QMessageBox.warning(self, "Input Error", "Please enter numeric good and poor reflection values.")
+            return None
+
+        if good_threshold <= 0 or poor_threshold <= 0 or good_threshold >= poor_threshold:
+            if show_message:
+                QMessageBox.warning(
+                    self,
+                    "Input Error",
+                    "Good resolution must be positive and smaller than poor resolution."
+                )
+            return None
+
+        return good_threshold, poor_threshold
+
+    def plot_reflection_resolution(self, show_message_on_error=True):
+        if not _MATPLOTLIB_OK:
+            QMessageBox.warning(
+                self, "Missing Library",
+                "matplotlib is required.\nInstall with:  pip install matplotlib"
+            )
+            return
+
+        if self.df_all is None or self.df_all.empty:
+            if show_message_on_error:
+                QMessageBox.warning(self, "No Data", "Please convert data before plotting.")
+            return
+
+        thresholds = self._get_reflection_thresholds(show_message=show_message_on_error)
+        if thresholds is None:
+            return
+        good_threshold, poor_threshold = thresholds
+
+        horizontal, vertical, x_values, y_values = build_delta_reflection_plot_data(
+            self.df_all, self.current_reflection_parameter
+        )
+        delta_matrix = horizontal if self.current_reflection_mode == "horizontal" else vertical
+        magnitude_matrix = np.abs(delta_matrix)
+        finite_values = magnitude_matrix[np.isfinite(magnitude_matrix)]
+        if finite_values.size == 0:
+            if show_message_on_error:
+                QMessageBox.warning(self, "No Data", "No reflection-coefficient values were available to plot.")
+            return
+
+        v_min = float(finite_values.min())
+        v_avg = float(finite_values.mean())
+        v_max = float(finite_values.max())
+
+        self.reflection_status_label.setText(
+            f"{self.current_reflection_parameter} {self.current_reflection_mode} |ΔΓ|: min {v_min:.4g}, avg {v_avg:.4g}, max {v_max:.4g} | "
+            f"green≤{good_threshold:g}, red≥{poor_threshold:g}"
+        )
+        self._draw_reflection_plot(magnitude_matrix, x_values, y_values, good_threshold, poor_threshold)
+
+    def _draw_reflection_plot(self, magnitude_matrix, x_values, y_values, good_threshold, poor_threshold):
+        self.reflection_figure.clear()
+        ax = self.reflection_figure.add_subplot(111)
+
+        cmap = _get_cmap("RdYlGn_r")
+        norm = Normalize(vmin=good_threshold, vmax=poor_threshold, clip=True)
+        im = ax.imshow(
+            magnitude_matrix,
+            aspect="auto",
+            origin="lower",
+            cmap=cmap,
+            norm=norm,
+            interpolation="nearest",
+            extent=[0, len(x_values), 0, len(y_values)],
+        )
+        ax.set_xlabel("C1 Position (0 - 447)", fontsize=9)
+        ax.set_ylabel("C2 Position (0 - 447)", fontsize=9)
+        ax.set_title(
+            f"Reflect Coefficient |ΔΓ| Map - {self.current_reflection_parameter} ({self.current_reflection_mode})",
+            fontsize=11,
+            fontweight="bold",
+        )
+        ax.tick_params(labelsize=8)
+        for boundary in range(64, max(len(x_values), len(y_values)), 64):
+            ax.axvline(boundary, color="white", linewidth=0.35, alpha=0.5)
+            ax.axhline(boundary, color="white", linewidth=0.35, alpha=0.5)
+
+        colorbar = self.reflection_figure.colorbar(im, ax=ax, pad=0.02)
+        colorbar.set_label(f"|ΔΓ|  (green <= {good_threshold:g}, red >= {poor_threshold:g})", fontsize=9)
+        self.reflection_canvas.draw()
+
     def refresh_smith_chart(self):
         if self.df_all is None or self.df_all.empty:
             return
 
         self.current_smith_parameter = self.smith_parameter_combo.currentText().strip()
         self.df_smith_points = build_smith_chart_plot_data(self.df_all, self.current_smith_parameter)
+        if {"S22_r", "S22_x"}.issubset(set(self.df_all.columns)):
+            self.smith_dz_lookup = build_smith_dz_lookup(self.df_all)
+        else:
+            self.smith_dz_lookup = {}
+        if {f"{self.current_smith_parameter}_r", f"{self.current_smith_parameter}_x"}.issubset(set(self.df_all.columns)):
+            self.smith_dgamma_lookup = build_smith_dgamma_lookup(
+                self.df_all,
+                self.current_smith_parameter,
+                self.current_reflection_mode,
+            )
+        else:
+            self.smith_dgamma_lookup = {}
 
-        self.smith_status_label.setText(
-            f"{self.current_smith_parameter}: {len(self.df_smith_points):,} points"
-        )
+        if self.current_smith_mode == "dz":
+            thresholds = self._get_dz_thresholds(show_message=False)
+            if thresholds is None:
+                good_threshold, poor_threshold = 0.0001, 0.1
+            else:
+                good_threshold, poor_threshold = thresholds
+            dz_count = sum(
+                1 for point in self.df_smith_points
+                if (point["x_c1"], point["y_c2"]) in self.smith_dz_lookup
+            )
+            self.smith_status_label.setText(
+                f"{self.current_smith_parameter}: {len(self.df_smith_points):,} points | dZ colors on {dz_count:,} points | green≤{good_threshold:g}, red≥{poor_threshold:g}"
+            )
+        elif self.current_smith_mode == "dgamma":
+            thresholds = self._get_reflection_thresholds(show_message=False)
+            if thresholds is None:
+                good_threshold, poor_threshold = 0.1, 0.9
+            else:
+                good_threshold, poor_threshold = thresholds
+            dgamma_count = sum(
+                1 for point in self.df_smith_points
+                if (point["x_c1"], point["y_c2"]) in self.smith_dgamma_lookup
+            )
+            self.smith_status_label.setText(
+                f"{self.current_smith_parameter}: {len(self.df_smith_points):,} points | dΓ({self.current_reflection_mode}) colors on {dgamma_count:,} points | green≤{good_threshold:g}, red≥{poor_threshold:g}"
+            )
+        elif self.current_smith_mode == "dvswr":
+            self.smith_status_label.setText(
+                f"{self.current_smith_parameter}: {len(self.df_smith_points):,} points | dVSWR under construction"
+            )
+        else:
+            self.smith_status_label.setText(
+                f"{self.current_smith_parameter}: {len(self.df_smith_points):,} points"
+            )
 
         self._draw_smith_chart(self.df_smith_points, self.current_smith_parameter)
+
+    def _on_smith_mode_changed(self, mode_name, checked):
+        if not checked:
+            return
+        self.current_smith_mode = mode_name
+        if self.df_all is not None and not self.df_all.empty:
+            self.refresh_smith_chart()
+
+    def _on_dz_threshold_changed(self):
+        if self.current_smith_mode == "dz" and self.df_all is not None and not self.df_all.empty:
+            self.refresh_smith_chart()
+
+    def _get_dz_thresholds(self, show_message=False):
+        try:
+            good_threshold = float(self.dz_good_edit.text().strip() or "0")
+            poor_threshold = float(self.dz_poor_edit.text().strip() or "0")
+        except ValueError:
+            if show_message:
+                QMessageBox.warning(self, "Input Error", "Please enter numeric good and poor resolution values.")
+            return None
+
+        if good_threshold <= 0 or poor_threshold <= 0 or good_threshold >= poor_threshold:
+            if show_message:
+                QMessageBox.warning(
+                    self,
+                    "Input Error",
+                    "Good resolution must be positive and smaller than poor resolution."
+                )
+            return None
+
+        return good_threshold, poor_threshold
 
     def _draw_smith_chart(self, points, parameter_name):
         if not _MATPLOTLIB_OK:
@@ -1818,23 +2335,120 @@ class MatchResolutionGui(QMainWindow):
                 values = np.conjugate(values)
             self.smith_plot_values = values
             self.smith_plot_points = points
-            colors = np.arange(len(values))
-            self.smith_scatter = ax.scatter(
-                values.real,
-                values.imag,
-                c=colors,
-                cmap="viridis",
-                s=14,
-                alpha=0.8,
-                edgecolors="none",
-                picker=True,
-            )
+            if self.current_smith_mode == "dz":
+                thresholds = self._get_dz_thresholds(show_message=False)
+                dz_values = np.array(
+                    [
+                        self.smith_dz_lookup.get((point["x_c1"], point["y_c2"]), np.nan)
+                        for point in points
+                    ],
+                    dtype=float,
+                )
+                finite_mask = np.isfinite(dz_values)
+                if np.any(finite_mask):
+                    if thresholds is not None:
+                        good_threshold, poor_threshold = thresholds
+                    else:
+                        good_threshold, poor_threshold = 0.0001, 0.1
+                    plotted_values = np.where(finite_mask, dz_values, good_threshold)
+                    self.smith_scatter = ax.scatter(
+                        values.real,
+                        values.imag,
+                        c=plotted_values,
+                        cmap="RdYlGn_r",
+                        vmin=good_threshold,
+                        vmax=poor_threshold,
+                        s=14,
+                        alpha=0.9,
+                        edgecolors="none",
+                        picker=True,
+                    )
+                    colorbar = self.smith_figure.colorbar(self.smith_scatter, ax=ax, pad=0.02, shrink=0.85)
+                    colorbar.set_label(
+                        f"|ΔZ| (ohms)  green≤{good_threshold:g}, red≥{poor_threshold:g}",
+                        fontsize=9,
+                    )
+                else:
+                    colors = np.arange(len(values))
+                    self.smith_scatter = ax.scatter(
+                        values.real,
+                        values.imag,
+                        c=colors,
+                        cmap="viridis",
+                        s=14,
+                        alpha=0.8,
+                        edgecolors="none",
+                        picker=True,
+                    )
+            elif self.current_smith_mode == "dgamma":
+                thresholds = self._get_reflection_thresholds(show_message=False)
+                dgamma_values = np.array(
+                    [
+                        self.smith_dgamma_lookup.get((point["x_c1"], point["y_c2"]), np.nan)
+                        for point in points
+                    ],
+                    dtype=float,
+                )
+                finite_mask = np.isfinite(dgamma_values)
+                if np.any(finite_mask):
+                    if thresholds is not None:
+                        good_threshold, poor_threshold = thresholds
+                    else:
+                        good_threshold, poor_threshold = 0.1, 0.9
+                    plotted_values = np.where(finite_mask, dgamma_values, good_threshold)
+                    self.smith_scatter = ax.scatter(
+                        values.real,
+                        values.imag,
+                        c=plotted_values,
+                        cmap="RdYlGn_r",
+                        vmin=good_threshold,
+                        vmax=poor_threshold,
+                        s=14,
+                        alpha=0.9,
+                        edgecolors="none",
+                        picker=True,
+                    )
+                    colorbar = self.smith_figure.colorbar(self.smith_scatter, ax=ax, pad=0.02, shrink=0.85)
+                    colorbar.set_label(
+                        f"|ΔΓ| ({self.current_reflection_mode})  green≤{good_threshold:g}, red≥{poor_threshold:g}",
+                        fontsize=9,
+                    )
+                else:
+                    colors = np.arange(len(values))
+                    self.smith_scatter = ax.scatter(
+                        values.real,
+                        values.imag,
+                        c=colors,
+                        cmap="viridis",
+                        s=14,
+                        alpha=0.8,
+                        edgecolors="none",
+                        picker=True,
+                    )
+            else:
+                colors = np.arange(len(values))
+                self.smith_scatter = ax.scatter(
+                    values.real,
+                    values.imag,
+                    c=colors,
+                    cmap="viridis",
+                    s=14,
+                    alpha=0.8,
+                    edgecolors="none",
+                    picker=True,
+                )
         else:
             self.smith_plot_values = np.array([], dtype=complex)
             self.smith_plot_points = []
             self.smith_scatter = None
 
-        ax.set_title(f"Smith Chart - {parameter_name}", fontsize=11, fontweight="bold")
+        mode_label = {
+            "xy": "X-Y Table",
+            "dz": "dZ",
+            "dgamma": f"dΓ ({self.current_reflection_mode})",
+            "dvswr": "dVSWR (Under construction)",
+        }.get(self.current_smith_mode, "X-Y Table")
+        ax.set_title(f"Smith Chart - {parameter_name} [{mode_label}]", fontsize=11, fontweight="bold")
         self.smith_canvas.draw()
 
     def toggle_smith_conjugate(self, checked):
@@ -1896,20 +2510,10 @@ class MatchResolutionGui(QMainWindow):
             QMessageBox.warning(self, "No Data", "Please convert data before plotting.")
             return
 
-        try:
-            good_threshold = float(self.dz_good_edit.text().strip() or "0")
-            poor_threshold = float(self.dz_poor_edit.text().strip() or "0")
-        except ValueError:
-            QMessageBox.warning(self, "Input Error", "Please enter numeric good and poor resolution values.")
+        thresholds = self._get_dz_thresholds(show_message=True)
+        if thresholds is None:
             return
-
-        if good_threshold <= 0 or poor_threshold <= 0 or good_threshold >= poor_threshold:
-            QMessageBox.warning(
-                self,
-                "Input Error",
-                "Good resolution must be positive and smaller than poor resolution."
-            )
-            return
+        good_threshold, poor_threshold = thresholds
 
         horizontal, vertical, x_values, y_values = build_delta_impedance_plot_data(self.df_all)
         horizontal_finite = horizontal[np.isfinite(horizontal)]
@@ -2019,6 +2623,7 @@ class MatchResolutionGui(QMainWindow):
             self.refresh_xy_table()
             self.refresh_impedance_table()
             self.refresh_dz_table()
+            self.refresh_reflection_table()
             self.refresh_smith_chart()
 
             total_rows = len(self.df_all)
@@ -2054,6 +2659,7 @@ class MatchResolutionGui(QMainWindow):
             f"X-Y tab uses {self.current_xy_parameter}.\n"
             f"Impedance tab uses {self.current_impedance_parameter}.\n"
             f"dZ tab uses {self.current_dz_parameter}.\n"
+            f"Reflect Coefficient tab uses {self.current_reflection_parameter} {self.current_reflection_mode}.\n"
             f"Smith Chart uses {self.current_smith_parameter}."
             )
 
@@ -2074,6 +2680,11 @@ class MatchResolutionGui(QMainWindow):
             default_name = base_name + f"_{self.current_impedance_parameter.lower()}_impedance_table.csv"
         elif current_tab == "dZ" and self.df_dz_display is not None:
             default_name = base_name + f"_{self.current_dz_parameter.lower().replace(' ', '_')}_dz_table.csv"
+        elif current_tab == "Reflect Coefficient" and self.df_reflection_display is not None:
+            default_name = (
+                base_name
+                + f"_{self.current_reflection_parameter.lower()}_{self.current_reflection_mode}_reflect_coefficient_table.csv"
+            )
         else:
             default_name = base_name + f"_{self.current_xy_parameter.lower()}_xy_table.csv"
 
@@ -2092,6 +2703,8 @@ class MatchResolutionGui(QMainWindow):
                 self.df_impedance_display.to_csv(save_path, index=False, header=False)
             elif current_tab == "dZ" and self.df_dz_display is not None:
                 self.df_dz_display.to_csv(save_path, index=False, header=False)
+            elif current_tab == "Reflect Coefficient" and self.df_reflection_display is not None:
+                self.df_reflection_display.to_csv(save_path, index=False, header=False)
             elif self.df_xy_display is not None:
                 self.df_xy_display.to_csv(save_path, index=False, header=False)
             else:
