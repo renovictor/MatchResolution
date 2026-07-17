@@ -1,7 +1,17 @@
 # Changelog
 
+## V1.0.4
+
+- Added robust reduced-grid import support by counting data rows and handling trailing-comma CSV rows.
+- Added legacy command parsing compatibility for `caps hf ps1 x1 x2 x3 x4`.
+- Updated initial defaults: `ΔΓ good=0, poor=0.03` and `ΔZ good=0.001, poor=1`.
+
 ## V1.0.3
 
+- Added support for reduced/sparse fine-position input files (for example: `0,15,16,31,32,47,48,63`) by building X/Y axes from actual positions present in the data.
+- Improved CSV import detection by counting data rows (supports full `200,704` and reduced `3,136` grids) and handling trailing-comma rows during parsing.
+- Added support for legacy command format with pulse token: `caps hf ps1 x1 x2 x3 x4`.
+- Updated initial delta-`Γ` thresholds to `good=0` and `poor=0.03`.
 - Added Smith Chart view selectors: `X-Y Table`, `dZ`, `dΓ` (under construction), `dVSWR` (under construction).
 - Added dZ color-mapped Smith plotting using S22 delta-impedance resolution.
 - Implemented `Reflect Coefficient` tab with X-Y-derived delta-`Γ` resolution (`current - previous`) table and green/red range plot.
