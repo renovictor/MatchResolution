@@ -680,6 +680,56 @@ def build_reflection_display_table(df, parameter_name, orientation):
     return pd.DataFrame(presentation_rows)
 
 
+def build_efficiency_display_table(df, parameter_name):
+    """
+    Build a spreadsheet-like X-Y table showing efficiency values.
+    Efficiency = 1 - |Sxx|^2 where Sxx is the reflection coefficient.
+    """
+    real_col = f"{parameter_name}_r"
+    imag_col = f"{parameter_name}_x"
+
+    if real_col not in df.columns or imag_col not in df.columns:
+        raise ValueError(f"Missing columns for {parameter_name}.")
+
+    x_values, y_values = extract_xy_axis_values(df)
+
+    x_lookup = {value: index for index, value in enumerate(x_values)}
+    y_lookup = {value: index for index, value in enumerate(y_values)}
+    x_denominator = max(x_values) if max(x_values) > 0 else 1
+    y_denominator = max(y_values) if max(y_values) > 0 else 1
+
+    grid = [["" for _ in x_values] for _ in y_values]
+
+    for row in df[["X_C1", "Y_C2", real_col, imag_col]].itertuples(index=False):
+        x_pos = int(row[0])
+        y_pos = int(row[1])
+        real_value = row[2]
+        imag_value = row[3]
+        if pd.isna(real_value) or pd.isna(imag_value):
+            continue
+        s_param = complex(real_value, imag_value)
+        s_magnitude = abs(s_param)
+        efficiency = 1.0 - (s_magnitude ** 2)
+        grid[y_lookup[y_pos]][x_lookup[x_pos]] = f"{efficiency:.4f}"
+
+    presentation_rows = []
+    presentation_rows.append(["", "", "c1 coarse"] + [str(x // 64) for x in x_values])
+    presentation_rows.append(["", f"Efficiency({parameter_name})", "c1 fine"] + [str(x % 64) for x in x_values])
+    presentation_rows.append(["C2 coarse", "c2 fine", "percentage"] + [f"{(x / x_denominator) * 100:.2f}%" for x in x_values])
+
+    for y_index, y_value in enumerate(y_values):
+        presentation_rows.append(
+            [
+                str(y_value // 64),
+                str(y_value % 64),
+                f"{(y_value / y_denominator) * 100:.2f}%",
+                *grid[y_index],
+            ]
+        )
+
+    return pd.DataFrame(presentation_rows)
+
+
 def build_smith_chart_plot_data(df, parameter_name):
     real_col = f"{parameter_name}_r"
     imag_col = f"{parameter_name}_x"
@@ -1017,6 +1067,8 @@ class MatchResolutionGui(QMainWindow):
         self.df_reflection_display = None
         self.current_reflection_parameter = "S22"
         self.current_reflection_mode = "horizontal"
+        self.df_efficiency_display = None
+        self.current_efficiency_parameter = "S22"
         self.df_smith_points = None
         self.current_smith_parameter = "S22"
         self.smith_plot_points = []
@@ -1671,16 +1723,69 @@ class MatchResolutionGui(QMainWindow):
         self.reflection_splitter.setSizes([520, 220])
         reflection_layout.addWidget(self.reflection_splitter)
 
-        self.vswr_tab = self.build_tab_page("VSWR", self.placeholder_text("VSWR"))
+        efficiency_toolbar = QFrame()
+        efficiency_toolbar.setStyleSheet("""
+            QFrame {
+                background-color: #FCE4EC;
+                border-radius: 10px;
+                padding: 8px;
+            }
+        """)
+        efficiency_toolbar_layout = QHBoxLayout(efficiency_toolbar)
+
+        efficiency_toolbar_layout.addWidget(QLabel("Parameter:"))
+        self.efficiency_parameter_combo = QComboBox()
+        self.efficiency_parameter_combo.addItems(XY_PARAMETERS)
+        self.efficiency_parameter_combo.setCurrentText("S22")
+        self.efficiency_parameter_combo.currentTextChanged.connect(self.refresh_efficiency_table)
+        efficiency_toolbar_layout.addWidget(self.efficiency_parameter_combo)
+
+        efficiency_toolbar_layout.addWidget(QLabel("Efficiency = 1 - |Sxx|² where Sxx is reflection coefficient."))
+        self.efficiency_cell_label = QLabel("Click a cell to see the value here.")
+        self.efficiency_cell_label.setStyleSheet("""
+            QLabel {
+                color: #880E4F;
+                background-color: #F8BBD0;
+                border: 1px solid #E91E63;
+                border-radius: 8px;
+                padding: 6px 10px;
+                font-weight: bold;
+            }
+        """)
+        efficiency_toolbar_layout.addWidget(self.efficiency_cell_label, stretch=1)
+        efficiency_toolbar_layout.addStretch(1)
+
+        self.efficiency_table_view = QTableView()
+        self.efficiency_table_view.setAlternatingRowColors(False)
+        self.efficiency_table_view.setMinimumHeight(240)
+        self.efficiency_table_view.setStyleSheet("""
+            QTableView {
+                background-color: white;
+                gridline-color: #90A4AE;
+                font-size: 12px;
+            }
+            QHeaderView::section {
+                background-color: #C2185B;
+                color: white;
+                padding: 4px;
+                border: 1px solid #E91E63;
+                font-weight: bold;
+            }
+        """)
+        self.efficiency_table_page = self.create_table_page(self.efficiency_table_view, efficiency_toolbar)
+
+        self.efficiency_tab = QWidget()
+        efficiency_layout = QVBoxLayout(self.efficiency_tab)
+        efficiency_layout.addWidget(self.efficiency_table_page)
 
         self.tabs.addTab(self.component_tab, "Component")
         self.tabs.addTab(self.reflection_tab, "Reflect Coefficient")
-        self.tabs.addTab(self.vswr_tab, "VSWR")
+        self.tabs.addTab(self.efficiency_tab, "Efficiency")
 
         main_layout.addWidget(self.tabs, stretch=1)
 
         note = QLabel(
-            "Note: Display tab shows the converted row table. X-Y Table shows the grid view for the selected S-parameter. dZ shows delta impedance for S22. Reflect Coefficient tab shows delta-Γ resolution from X-Y data. Smith Chart supports X-Y Table, dZ, and dΓ coloring; dVSWR is under construction."
+            "Note: Display tab shows the converted row table. X-Y Table shows the grid view for the selected S-parameter. dZ shows delta impedance for S22. Reflect Coefficient tab shows delta-Γ resolution from X-Y data. Efficiency tab shows power efficiency (1 - |Sxx|²) for the selected S-parameter. Smith Chart supports X-Y Table, dZ, and dΓ coloring; dVSWR is under construction."
         )
         note.setAlignment(Qt.AlignCenter)
         note.setStyleSheet("font-size: 13px; color: #607D8B; padding: 6px;")
@@ -2201,6 +2306,47 @@ class MatchResolutionGui(QMainWindow):
         else:
             self.reflection_cell_label.setText(f"Row {row + 1}, Col {column + 1}: {value}")
 
+    def refresh_efficiency_table(self):
+        if self.df_all is None or self.df_all.empty:
+            return
+
+        self.current_efficiency_parameter = self.efficiency_parameter_combo.currentText().strip()
+        self.df_efficiency_display = build_efficiency_display_table(
+            self.df_all,
+            self.current_efficiency_parameter,
+        )
+
+        self.efficiency_table_model = PandasTableModel(self.df_efficiency_display)
+        self.efficiency_table_view.setModel(self.efficiency_table_model)
+        self.efficiency_table_view.horizontalHeader().setVisible(False)
+        self.efficiency_table_view.verticalHeader().setVisible(False)
+        self.efficiency_table_view.horizontalHeader().setSectionResizeMode(QHeaderView.Fixed)
+        self.efficiency_table_view.horizontalHeader().setDefaultSectionSize(80)
+        self.efficiency_table_view.verticalHeader().setDefaultSectionSize(24)
+        self.efficiency_table_view.setSelectionBehavior(QTableView.SelectItems)
+        self.efficiency_table_view.setSelectionMode(QTableView.SingleSelection)
+        selection_model = self.efficiency_table_view.selectionModel()
+        if selection_model is not None:
+            selection_model.currentChanged.connect(self.update_efficiency_cell_label)
+        self.efficiency_cell_label.setText("Click a cell to see the value here.")
+
+    def update_efficiency_cell_label(self, current, previous):
+        if not current.isValid() or self.df_efficiency_display is None:
+            self.efficiency_cell_label.setText("Click a cell to see the value here.")
+            return
+
+        row = current.row()
+        column = current.column()
+        if row >= len(self.df_efficiency_display.index) or column >= len(self.df_efficiency_display.columns):
+            self.efficiency_cell_label.setText("Click a cell to see the value here.")
+            return
+
+        value = self.df_efficiency_display.iat[row, column]
+        if value == "":
+            self.efficiency_cell_label.setText(f"Row {row + 1}, Col {column + 1}: empty")
+        else:
+            self.efficiency_cell_label.setText(f"Row {row + 1}, Col {column + 1}: {value}")
+
     def _on_reflection_threshold_changed(self):
         if self.df_all is not None and not self.df_all.empty:
             self.plot_reflection_resolution(show_message_on_error=False)
@@ -2687,6 +2833,7 @@ class MatchResolutionGui(QMainWindow):
             self.refresh_impedance_table()
             self.refresh_dz_table()
             self.refresh_reflection_table()
+            self.refresh_efficiency_table()
             self.refresh_smith_chart()
 
             total_rows = len(self.df_all)
@@ -2723,6 +2870,7 @@ class MatchResolutionGui(QMainWindow):
             f"Impedance tab uses {self.current_impedance_parameter}.\n"
             f"dZ tab uses {self.current_dz_parameter}.\n"
             f"Reflect Coefficient tab uses {self.current_reflection_parameter} {self.current_reflection_mode}.\n"
+            f"Efficiency tab uses {self.current_efficiency_parameter}.\n"
             f"Smith Chart uses {self.current_smith_parameter}."
             )
 
@@ -2748,6 +2896,8 @@ class MatchResolutionGui(QMainWindow):
                 base_name
                 + f"_{self.current_reflection_parameter.lower()}_{self.current_reflection_mode}_reflect_coefficient_table.csv"
             )
+        elif current_tab == "Efficiency" and self.df_efficiency_display is not None:
+            default_name = base_name + f"_{self.current_efficiency_parameter.lower()}_efficiency_table.csv"
         else:
             default_name = base_name + f"_{self.current_xy_parameter.lower()}_xy_table.csv"
 
@@ -2768,6 +2918,8 @@ class MatchResolutionGui(QMainWindow):
                 self.df_dz_display.to_csv(save_path, index=False, header=False)
             elif current_tab == "Reflect Coefficient" and self.df_reflection_display is not None:
                 self.df_reflection_display.to_csv(save_path, index=False, header=False)
+            elif current_tab == "Efficiency" and self.df_efficiency_display is not None:
+                self.df_efficiency_display.to_csv(save_path, index=False, header=False)
             elif self.df_xy_display is not None:
                 self.df_xy_display.to_csv(save_path, index=False, header=False)
             else:
