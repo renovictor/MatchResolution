@@ -804,6 +804,41 @@ def build_smith_dgamma_lookup(df, parameter_name, orientation):
     return dgamma_lookup
 
 
+def build_smith_efficiency_lookup(df):
+    """
+    Build a lookup table for Smith-chart efficiency coloring.
+    Efficiency = (1 - |S11|²) × |S21|²
+    """
+    x_values, y_values = extract_xy_axis_values(df)
+    
+    s11_r_col = "S11_r"
+    s11_x_col = "S11_x"
+    s21_r_col = "S21_r"
+    s21_x_col = "S21_x"
+
+    if not all(col in df.columns for col in [s11_r_col, s11_x_col, s21_r_col, s21_x_col]):
+        return {}
+
+    efficiency_lookup = {}
+    for row in df[["X_C1", "Y_C2", s11_r_col, s11_x_col, s21_r_col, s21_x_col]].itertuples(index=False):
+        x_pos = int(row[0])
+        y_pos = int(row[1])
+        s11_real = row[2]
+        s11_imag = row[3]
+        s21_real = row[4]
+        s21_imag = row[5]
+        if pd.isna(s11_real) or pd.isna(s11_imag) or pd.isna(s21_real) or pd.isna(s21_imag):
+            continue
+        s11 = complex(s11_real, s11_imag)
+        s21 = complex(s21_real, s21_imag)
+        s11_magnitude = abs(s11)
+        s21_magnitude = abs(s21)
+        efficiency = (1.0 - (s11_magnitude ** 2)) * (s21_magnitude ** 2)
+        efficiency_lookup[(x_pos, y_pos)] = float(efficiency)
+
+    return efficiency_lookup
+
+
 def draw_smith_chart_grid(ax):
     ax.clear()
     ax.set_aspect("equal", adjustable="box")
@@ -1084,6 +1119,9 @@ class MatchResolutionGui(QMainWindow):
         self.current_smith_mode = "xy"
         self.smith_dz_lookup = {}
         self.smith_dgamma_lookup = {}
+        self.smith_efficiency_lookup = {}
+        self.efficiency_good_threshold = 0.5
+        self.efficiency_poor_threshold = 0.1
 
         self.init_ui()
 
@@ -1573,13 +1611,13 @@ class MatchResolutionGui(QMainWindow):
         self.smith_mode_xy_radio = QRadioButton("X-Y Table")
         self.smith_mode_dz_radio = QRadioButton("dZ")
         self.smith_mode_dgamma_radio = QRadioButton("dΓ")
-        self.smith_mode_dvswr_radio = QRadioButton("dVSWR")
+        self.smith_mode_efficiency_radio = QRadioButton("Efficiency")
 
         for mode, radio_button in (
             ("xy", self.smith_mode_xy_radio),
             ("dz", self.smith_mode_dz_radio),
             ("dgamma", self.smith_mode_dgamma_radio),
-            ("dvswr", self.smith_mode_dvswr_radio),
+            ("efficiency", self.smith_mode_efficiency_radio),
         ):
             radio_button.setStyleSheet("QRadioButton { color: #D32F2F; font-size: 14px; }")
             self.smith_mode_group.addButton(radio_button)
@@ -1773,9 +1811,48 @@ class MatchResolutionGui(QMainWindow):
         """)
         self.efficiency_table_page = self.create_table_page(self.efficiency_table_view, efficiency_toolbar)
 
+        efficiency_plot_frame = QFrame()
+        efficiency_plot_frame.setStyleSheet("""
+            QFrame {
+                background-color: #FCE4EC;
+                border: 1px solid #F8BBD0;
+                border-radius: 10px;
+            }
+        """)
+        efficiency_plot_layout = QVBoxLayout(efficiency_plot_frame)
+        efficiency_plot_layout.setContentsMargins(12, 12, 12, 12)
+
+        efficiency_plot_controls = QHBoxLayout()
+        efficiency_plot_controls.addWidget(QLabel("Good η ≥"))
+        self.efficiency_good_edit = QLineEdit("50")
+        self.efficiency_good_edit.setFixedWidth(80)
+        self.efficiency_good_edit.setValidator(QDoubleValidator(0.0, 100.0, 1))
+        self.efficiency_good_edit.editingFinished.connect(self._on_efficiency_threshold_changed)
+        efficiency_plot_controls.addWidget(self.efficiency_good_edit)
+        efficiency_plot_controls.addWidget(QLabel("%"))
+        
+        efficiency_plot_controls.addWidget(QLabel("  Poor η ≤"))
+        self.efficiency_poor_edit = QLineEdit("10")
+        self.efficiency_poor_edit.setFixedWidth(80)
+        self.efficiency_poor_edit.setValidator(QDoubleValidator(0.0, 100.0, 1))
+        self.efficiency_poor_edit.editingFinished.connect(self._on_efficiency_threshold_changed)
+        efficiency_plot_controls.addWidget(self.efficiency_poor_edit)
+        efficiency_plot_controls.addWidget(QLabel("%"))
+        
+        efficiency_plot_controls.addStretch(1)
+        efficiency_plot_layout.addLayout(efficiency_plot_controls)
+
+        self.efficiency_status_label = QLabel("Set efficiency thresholds for Smith Chart coloring.")
+        self.efficiency_status_label.setStyleSheet("font-size: 13px; color: #880E4F; padding: 4px;")
+        efficiency_plot_layout.addWidget(self.efficiency_status_label)
+
         self.efficiency_tab = QWidget()
         efficiency_layout = QVBoxLayout(self.efficiency_tab)
-        efficiency_layout.addWidget(self.efficiency_table_page)
+        self.efficiency_splitter = QSplitter(Qt.Vertical)
+        self.efficiency_splitter.addWidget(self.efficiency_table_page)
+        self.efficiency_splitter.addWidget(efficiency_plot_frame)
+        self.efficiency_splitter.setSizes([520, 220])
+        efficiency_layout.addWidget(self.efficiency_splitter)
 
         self.tabs.addTab(self.component_tab, "Component")
         self.tabs.addTab(self.reflection_tab, "Reflect Coefficient")
@@ -1784,7 +1861,7 @@ class MatchResolutionGui(QMainWindow):
         main_layout.addWidget(self.tabs, stretch=1)
 
         note = QLabel(
-            "Note: Display tab shows the converted row table. X-Y Table shows the grid view for the selected S-parameter. dZ shows delta impedance for S22. Reflect Coefficient tab shows delta-Γ resolution from X-Y data. Efficiency tab shows power transmission efficiency η = (1 - |S11|²) × |S21|². Smith Chart supports X-Y Table, dZ, and dΓ coloring; dVSWR is under construction."
+            "Note: Display tab shows the converted row table. X-Y Table shows the grid view for the selected S-parameter. dZ shows delta impedance for S22. Reflect Coefficient tab shows delta-Γ resolution from X-Y data. Efficiency tab shows power transmission efficiency η = (1 - |S11|²) × |S21|². Smith Chart supports X-Y Table, dZ, dΓ, and Efficiency coloring modes."
         )
         note.setAlignment(Qt.AlignCenter)
         note.setStyleSheet("font-size: 13px; color: #607D8B; padding: 6px;")
@@ -2342,6 +2419,43 @@ class MatchResolutionGui(QMainWindow):
         else:
             self.efficiency_cell_label.setText(f"Row {row + 1}, Col {column + 1}: {value}")
 
+    def _on_efficiency_threshold_changed(self):
+        if self.df_all is not None and not self.df_all.empty:
+            thresholds = self._get_efficiency_thresholds(show_message=False)
+            if thresholds is not None:
+                self.efficiency_good_threshold, self.efficiency_poor_threshold = thresholds
+            if self.current_smith_mode == "efficiency":
+                self.refresh_smith_chart()
+
+    def _get_efficiency_thresholds(self, show_message=False):
+        try:
+            good_threshold = float(self.efficiency_good_edit.text().strip() or "50") / 100.0
+            poor_threshold = float(self.efficiency_poor_edit.text().strip() or "10") / 100.0
+        except ValueError:
+            if show_message:
+                QMessageBox.warning(self, "Input Error", "Please enter numeric good and poor efficiency percentages.")
+            return None
+
+        if good_threshold < 0 or good_threshold > 1 or poor_threshold < 0 or poor_threshold > 1:
+            if show_message:
+                QMessageBox.warning(
+                    self,
+                    "Input Error",
+                    "Efficiency values must be between 0 and 100%."
+                )
+            return None
+
+        if good_threshold <= poor_threshold:
+            if show_message:
+                QMessageBox.warning(
+                    self,
+                    "Input Error",
+                    "Good efficiency must be greater than poor efficiency."
+                )
+            return None
+
+        return good_threshold, poor_threshold
+
     def _on_reflection_threshold_changed(self):
         if self.df_all is not None and not self.df_all.empty:
             self.plot_reflection_resolution(show_message_on_error=False)
@@ -2456,6 +2570,7 @@ class MatchResolutionGui(QMainWindow):
             )
         else:
             self.smith_dgamma_lookup = {}
+        self.smith_efficiency_lookup = build_smith_efficiency_lookup(self.df_all)
 
         if self.current_smith_mode == "dz":
             thresholds = self._get_dz_thresholds(show_message=False)
@@ -2483,9 +2598,15 @@ class MatchResolutionGui(QMainWindow):
             self.smith_status_label.setText(
                 f"{self.current_smith_parameter}: {len(self.df_smith_points):,} points | dΓ({self.current_reflection_mode}) colors on {dgamma_count:,} points | green≤{good_threshold:g}, red≥{poor_threshold:g}"
             )
-        elif self.current_smith_mode == "dvswr":
+        elif self.current_smith_mode == "efficiency":
+            efficiency_count = sum(
+                1 for point in self.df_smith_points
+                if (point["x_c1"], point["y_c2"]) in self.smith_efficiency_lookup
+            )
+            good_pct = self.efficiency_good_threshold * 100
+            poor_pct = self.efficiency_poor_threshold * 100
             self.smith_status_label.setText(
-                f"{self.current_smith_parameter}: {len(self.df_smith_points):,} points | dVSWR under construction"
+                f"S11/S21: {len(self.df_smith_points):,} points | Efficiency colors on {efficiency_count:,} points | green≥{good_pct:.1f}%, red≤{poor_pct:.1f}%"
             )
         else:
             self.smith_status_label.setText(
@@ -2629,14 +2750,58 @@ class MatchResolutionGui(QMainWindow):
                         edgecolors="none",
                         picker=True,
                     )
+            elif self.current_smith_mode == "efficiency":
+               efficiency_values = np.array(
+                   [
+                       self.smith_efficiency_lookup.get((point["x_c1"], point["y_c2"]), np.nan)
+                       for point in points
+                   ],
+                   dtype=float,
+               )
+               finite_mask = np.isfinite(efficiency_values)
+               if np.any(finite_mask):
+                   good_threshold = self.efficiency_good_threshold
+                   poor_threshold = self.efficiency_poor_threshold
+                   plotted_values = np.where(finite_mask, efficiency_values, poor_threshold)
+                   self.smith_scatter = ax.scatter(
+                       values.real,
+                       values.imag,
+                       c=plotted_values,
+                       cmap="RdYlGn",
+                       vmin=poor_threshold,
+                       vmax=good_threshold,
+                       s=14,
+                       alpha=0.9,
+                       edgecolors="none",
+                       picker=True,
+                   )
+                   colorbar = self.smith_figure.colorbar(self.smith_scatter, ax=ax, pad=0.02, shrink=0.85)
+                   good_pct = good_threshold * 100
+                   poor_pct = poor_threshold * 100
+                   colorbar.set_label(
+                       f"Efficiency (S11/S21)  green≥{good_pct:.1f}%, red≤{poor_pct:.1f}%",
+                       fontsize=9,
+                   )
+               else:
+                   colors = np.arange(len(values))
+                   self.smith_scatter = ax.scatter(
+                       values.real,
+                       values.imag,
+                       c=colors,
+                       cmap="viridis",
+                       s=14,
+                       alpha=0.8,
+                       edgecolors="none",
+                       picker=True,
+                   )
             else:
-                colors = np.arange(len(values))
-                self.smith_scatter = ax.scatter(
-                    values.real,
-                    values.imag,
-                    c=colors,
-                    cmap="viridis",
-                    s=14,
+               colors = np.arange(len(values))
+               self.smith_scatter = ax.scatter(
+                   values.real,
+                   values.imag,
+                   c=colors,
+                   cmap="viridis",
+                   s=14,
                     alpha=0.8,
                     edgecolors="none",
                     picker=True,

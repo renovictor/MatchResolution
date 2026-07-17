@@ -1,5 +1,14 @@
 # Changelog
 
+## V1.0.5
+
+- Replaced VSWR tab with Efficiency tab showing power transmission efficiency η = (1 - |S11|²) × |S21|²
+- Added X-Y grid display for efficiency values with interactive cell selection
+- Implemented Smith Chart Efficiency mode displaying impedance (S11) data color-coded by efficiency
+- Added user-configurable good/poor efficiency thresholds (default: 50% good, 10% poor) for Smith Chart coloring
+- Updated Smith Chart modes: replaced dVSWR with Efficiency mode
+- Added CSV export support for efficiency tables
+
 ## V1.0.4
 
 - Added robust reduced-grid import support by counting data rows and handling trailing-comma CSV rows.
