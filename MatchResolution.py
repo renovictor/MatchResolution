@@ -2,10 +2,11 @@ import os
 import re
 import sys
 
+import numpy as np
 import pandas as pd
 
 from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex
-from PySide6.QtGui import QColor, QBrush, QFont
+from PySide6.QtGui import QColor, QBrush, QFont, QDoubleValidator
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -14,6 +15,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QVBoxLayout,
     QHBoxLayout,
+    QGridLayout,
     QLabel,
     QPushButton,
     QLineEdit,
@@ -22,7 +24,26 @@ from PySide6.QtWidgets import (
     QFrame,
     QHeaderView,
     QTabWidget,
+    QScrollArea,
+    QSplitter,
 )
+
+try:
+    import matplotlib as _matplotlib
+    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+    from matplotlib.figure import Figure
+    from matplotlib.colors import Normalize
+    import matplotlib.cm as _mpl_cm
+
+    def _get_cmap(name):
+        """Compatibility: matplotlib ≥3.9 removed cm.get_cmap; use colormaps registry."""
+        if hasattr(_matplotlib, "colormaps"):
+            return _matplotlib.colormaps[name]
+        return _mpl_cm.get_cmap(name)   # matplotlib < 3.9 fallback
+
+    _MATPLOTLIB_OK = True
+except ImportError:
+    _MATPLOTLIB_OK = False
 
 
 EXPECTED_S_COLUMNS = [
@@ -34,6 +55,9 @@ EXPECTED_S_COLUMNS = [
 
 REQUIRED_TABLE_COLUMNS = ["Frequency", "CMD", *EXPECTED_S_COLUMNS]
 XY_PARAMETERS = ["S11", "S21", "S12", "S22"]
+IMPEDANCE_PARAMETERS = ["S11", "S22"]
+DEFAULT_Z0 = 50.0
+APP_VERSION = "V1.0.2"
 
 
 def is_float_text(text: str) -> bool:
@@ -327,6 +351,292 @@ def build_xy_display_table(df, parameter_name):
     return pd.DataFrame(presentation_rows)
 
 
+def reflect_to_impedance_value(s_r, s_x, z0=DEFAULT_Z0):
+    """Convert reflection coefficient (S_r + j*S_x) to a complex impedance value."""
+    if pd.isna(s_r) or pd.isna(s_x):
+        return None
+
+    gamma = complex(s_r, s_x)
+    denom = 1.0 - gamma
+    if abs(denom) < 1e-12:
+        return None
+
+    return z0 * (1.0 + gamma) / denom
+
+
+def reflect_to_impedance_text(s_r, s_x, z0=DEFAULT_Z0):
+    """Convert reflection coefficient (S_r + j*S_x) to impedance text."""
+    z = reflect_to_impedance_value(s_r, s_x, z0)
+    if z is None:
+        return "inf"
+
+    sign = "+" if z.imag >= 0 else "-"
+    return f"{z.real:.3g}{sign}{abs(z.imag):.3g}j"
+
+
+def _format_complex_delta_text(value):
+    if value is None:
+        return ""
+
+    if np.isnan(value.real) or np.isnan(value.imag):
+        return ""
+
+    if abs(value.real) < 1e-12 and abs(value.imag) < 1e-12:
+        return "0"
+
+    sign = "+" if value.imag >= 0 else "-"
+    return f"{value.real:.3g}{sign}{abs(value.imag):.3g}j"
+
+
+def build_impedance_matrix(df, parameter_name, z0=DEFAULT_Z0):
+    real_col = f"{parameter_name}_r"
+    imag_col = f"{parameter_name}_x"
+
+    if real_col not in df.columns or imag_col not in df.columns:
+        raise ValueError(f"Missing columns for {parameter_name}.")
+
+    x_max = int(df["X_C1"].max())
+    y_max = int(df["Y_C2"].max())
+    x_values = list(range(x_max + 1))
+    y_values = list(range(y_max + 1))
+
+    if not x_values or not y_values:
+        raise ValueError("Impedance table is empty.")
+
+    x_lookup = {value: index for index, value in enumerate(x_values)}
+    y_lookup = {value: index for index, value in enumerate(y_values)}
+
+    matrix = np.full((len(y_values), len(x_values)), np.nan + 0j, dtype=complex)
+
+    for row in df[["X_C1", "Y_C2", real_col, imag_col]].itertuples(index=False):
+        x_pos = int(row[0])
+        y_pos = int(row[1])
+        z_value = reflect_to_impedance_value(row[2], row[3], z0)
+        if z_value is None:
+            continue
+        matrix[y_lookup[y_pos]][x_lookup[x_pos]] = z_value
+
+    return matrix, x_values, y_values
+
+
+def build_impedance_display_table(df, parameter_name, z0=DEFAULT_Z0):
+    """
+    Build a spreadsheet-like X-Y table identical in layout to build_xy_display_table,
+    but each cell contains impedance Z = Z0*(1+Γ)/(1-Γ) instead of the raw
+    reflection coefficient.  Only meaningful for reflection parameters (S11, S22).
+    """
+    matrix, x_values, y_values = build_impedance_matrix(df, parameter_name, z0)
+    x_denominator = max(x_values) if max(x_values) > 0 else 1
+    y_denominator = max(y_values) if max(y_values) > 0 else 1
+
+    presentation_rows = []
+    presentation_rows.append(["", "", "c1 coarse"] + [str(x // 64) for x in x_values])
+    presentation_rows.append(["", f"Z({parameter_name})", "c1 fine"] + [str(x % 64) for x in x_values])
+    presentation_rows.append(["C2 coarse", "c2 fine", "percentage"] + [f"{(x / x_denominator) * 100:.2f}%" for x in x_values])
+
+    for y_index, y_value in enumerate(y_values):
+        grid_row = []
+        for value in matrix[y_index]:
+            if np.isnan(value.real) or np.isnan(value.imag):
+                grid_row.append("")
+            else:
+                sign = "+" if value.imag >= 0 else "-"
+                grid_row.append(f"{value.real:.3g}{sign}{abs(value.imag):.3g}j")
+        presentation_rows.append(
+            [
+                str(y_value // 64),
+                str(y_value % 64),
+                f"{(y_value / y_denominator) * 100:.2f}%",
+                *grid_row,
+            ]
+        )
+
+    return pd.DataFrame(presentation_rows)
+
+
+def build_delta_impedance_display_table(df, orientation, z0=DEFAULT_Z0):
+    """
+    Build a spreadsheet-like X-Y table that shows delta impedance values for S22.
+    Horizontal means delta against the previous C1 position in the same row.
+    Vertical means delta against the previous C2 position in the same column.
+    """
+    if orientation not in ("S22 horizontal", "S22 vertical"):
+        raise ValueError(f"Unknown delta-impedance orientation: {orientation}")
+
+    matrix, x_values, y_values = build_impedance_matrix(df, "S22", z0)
+    delta_matrix = np.full(matrix.shape, np.nan, dtype=float)
+
+    if orientation == "S22 horizontal":
+        delta_matrix[:, 0] = 0.0
+        for row_index in range(len(y_values)):
+            for col_index in range(1, len(x_values)):
+                current = matrix[row_index, col_index]
+                previous = matrix[row_index, col_index - 1]
+                if np.isnan(current.real) or np.isnan(current.imag) or np.isnan(previous.real) or np.isnan(previous.imag):
+                    continue
+                delta_matrix[row_index, col_index] = abs(current - previous)
+    else:
+        delta_matrix[0, :] = 0.0
+        for row_index in range(1, len(y_values)):
+            for col_index in range(len(x_values)):
+                current = matrix[row_index, col_index]
+                previous = matrix[row_index - 1, col_index]
+                if np.isnan(current.real) or np.isnan(current.imag) or np.isnan(previous.real) or np.isnan(previous.imag):
+                    continue
+                delta_matrix[row_index, col_index] = abs(current - previous)
+
+    x_denominator = max(x_values) if max(x_values) > 0 else 1
+    y_denominator = max(y_values) if max(y_values) > 0 else 1
+
+    presentation_rows = []
+    presentation_rows.append(["", "", "c1 coarse"] + [str(x // 64) for x in x_values])
+    presentation_rows.append(["", f"ΔZ({orientation})", "c1 fine"] + [str(x % 64) for x in x_values])
+    presentation_rows.append(["C2 coarse", "c2 fine", "percentage"] + [f"{(x / x_denominator) * 100:.2f}%" for x in x_values])
+
+    for y_index, y_value in enumerate(y_values):
+        grid_row = []
+        for value in delta_matrix[y_index]:
+            if np.isnan(value):
+                grid_row.append("")
+            elif abs(value) < 1e-12:
+                grid_row.append("0")
+            else:
+                grid_row.append(f"{value:.6g}")
+        presentation_rows.append(
+            [
+                str(y_value // 64),
+                str(y_value % 64),
+                f"{(y_value / y_denominator) * 100:.2f}%",
+                *grid_row,
+            ]
+        )
+
+    return pd.DataFrame(presentation_rows)
+
+
+def build_delta_impedance_plot_data(df, z0=DEFAULT_Z0):
+    """Return horizontal and vertical |ΔZ| grids for plotting."""
+    matrix, x_values, y_values = build_impedance_matrix(df, "S22", z0)
+
+    horizontal = np.full(matrix.shape, np.nan, dtype=float)
+    vertical = np.full(matrix.shape, np.nan, dtype=float)
+
+    horizontal[:, 0] = 0.0
+    for row_index in range(len(y_values)):
+        for col_index in range(1, len(x_values)):
+            current = matrix[row_index, col_index]
+            previous = matrix[row_index, col_index - 1]
+            if np.isnan(current.real) or np.isnan(current.imag) or np.isnan(previous.real) or np.isnan(previous.imag):
+                continue
+            horizontal[row_index, col_index] = abs(current - previous)
+
+    vertical[0, :] = 0.0
+    for row_index in range(1, len(y_values)):
+        for col_index in range(len(x_values)):
+            current = matrix[row_index, col_index]
+            previous = matrix[row_index - 1, col_index]
+            if np.isnan(current.real) or np.isnan(current.imag) or np.isnan(previous.real) or np.isnan(previous.imag):
+                continue
+            vertical[row_index, col_index] = abs(current - previous)
+
+    return horizontal, vertical, x_values, y_values
+
+
+def build_smith_chart_plot_data(df, parameter_name):
+    real_col = f"{parameter_name}_r"
+    imag_col = f"{parameter_name}_x"
+
+    if real_col not in df.columns or imag_col not in df.columns:
+        raise ValueError(f"Missing columns for {parameter_name}.")
+
+    points = []
+    for row in df[["X_C1", "Y_C2", real_col, imag_col]].itertuples(index=False):
+        real_value = row[2]
+        imag_value = row[3]
+        if pd.isna(real_value) or pd.isna(imag_value):
+            continue
+        gamma = complex(real_value, imag_value)
+        impedance = reflect_to_impedance_value(real_value, imag_value) if parameter_name in IMPEDANCE_PARAMETERS else None
+        points.append({
+            "x_c1": int(row[0]),
+            "y_c2": int(row[1]),
+            "gamma": gamma,
+            "impedance": impedance,
+        })
+
+    return points
+
+
+def draw_smith_chart_grid(ax):
+    ax.clear()
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlim(-1.1, 1.1)
+    ax.set_ylim(-1.1, 1.1)
+    ax.set_xlabel("Real")
+    ax.set_ylabel("Imaginary")
+    ax.set_title("Smith Chart", fontsize=11, fontweight="bold")
+
+    ax.axhline(0, color="#B0BEC5", linewidth=0.8)
+    ax.axvline(0, color="#B0BEC5", linewidth=0.8)
+
+    unit_circle = plt_circle = None
+    try:
+        from matplotlib.patches import Circle
+        plt_circle = Circle((0, 0), 1.0, fill=False, edgecolor="#263238", linewidth=1.2)
+        ax.add_patch(plt_circle)
+    except Exception:
+        pass
+
+    resistance_values = [0.0, 0.2, 0.5, 1.0, 2.0, 5.0]
+    for resistance in resistance_values:
+        center = resistance / (1.0 + resistance)
+        radius = 1.0 / (1.0 + resistance)
+        circle = None
+        try:
+            from matplotlib.patches import Circle
+            circle = Circle((center, 0), radius, fill=False, edgecolor="#CFD8DC", linewidth=0.8)
+            ax.add_patch(circle)
+        except Exception:
+            pass
+
+    reactance_values = [0.2, 0.5, 1.0, 2.0, 5.0]
+    rs = np.linspace(0.0, 20.0, 700)
+    for reactance in reactance_values:
+        for sign in (1.0, -1.0):
+            zs = rs + 1j * (sign * reactance)
+            gammas = (zs - 1.0) / (zs + 1.0)
+            ax.plot(gammas.real, gammas.imag, color="#CFD8DC", linewidth=0.8)
+
+    ax.text(0.98, 0.02, "1 + j0", ha="right", va="bottom", fontsize=8, color="#607D8B")
+    ax.text(-0.98, 0.02, "0 + j0", ha="left", va="bottom", fontsize=8, color="#607D8B")
+    ax.grid(False)
+
+
+def calculate_cap_array(coarse_step_pf: float, fine_caps_pf: list) -> np.ndarray:
+    """
+    Calculate the equivalent capacitance for all 448 positions.
+
+    The cap bank has:
+      - 7 coarse states  (index 0-6), each step adds coarse_step_pf
+      - 64 fine states   (index 0-63), binary-weighted:
+            C_fine[s] = sum(fine_caps_pf[k] * bit_k(s)  for k in 0..5)
+        where fine_caps_pf = [Fine1, Fine2, Fine3, Fine4, Fine5, Fine6]
+        and Fine1 is the LSB (bit 0), Fine6 is the MSB (bit 5).
+
+    Total positions = 7 * 64 = 448.
+    position index = coarse_index * 64 + fine_state
+    C[pos] = coarse_index * coarse_step_pf + C_fine[fine_state]
+    """
+    fine_caps = np.array(fine_caps_pf, dtype=float)          # shape (6,)
+    fine_states = np.arange(64, dtype=int)
+    bits = ((fine_states[:, np.newaxis] >> np.arange(6)) & 1).astype(float)  # (64, 6)
+    fine_values = bits @ fine_caps                            # shape (64,)
+
+    coarse_values = np.arange(7, dtype=float) * coarse_step_pf  # shape (7,)
+    cap_matrix = coarse_values[:, np.newaxis] + fine_values[np.newaxis, :]   # (7, 64)
+    return cap_matrix.flatten()                               # shape (448,)
+
+
 def parse_match_file(file_path):
     """
     This parser supports two possible formats:
@@ -491,13 +801,23 @@ class MatchResolutionGui(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle("RF Matching Resolution Tool - Step 1: CMD to X-Y Table")
+        self.setWindowTitle(f"RF Matching Resolution Tool {APP_VERSION} - Step 1: CMD to X-Y Table")
         self.resize(1400, 850)
 
         self.df_all = None
         self.df_display = None
         self.df_xy_display = None
         self.current_xy_parameter = "S22"
+        self.df_impedance_display = None
+        self.current_impedance_parameter = "S11"
+        self.df_dz_display = None
+        self.current_dz_parameter = "S22 horizontal"
+        self.df_smith_points = None
+        self.current_smith_parameter = "S22"
+        self.smith_plot_points = []
+        self.smith_plot_values = np.array([], dtype=complex)
+        self.smith_scatter = None
+        self.smith_conjugate_enabled = False
 
         self.init_ui()
 
@@ -760,20 +1080,244 @@ class MatchResolutionGui(QMainWindow):
         self.xy_tab = self.create_table_page(self.xy_table_view, xy_toolbar)
         self.tabs.addTab(self.xy_tab, "X-Y Table")
 
-        self.component_tab = self.build_tab_page("Component", self.placeholder_text("Component"))
-        self.impedance_tab = self.build_tab_page("Impedance", self.placeholder_text("Impedance"))
+        impedance_toolbar = QFrame()
+        impedance_toolbar.setStyleSheet("""
+            QFrame {
+                background-color: #E8F5E9;
+                border-radius: 10px;
+                padding: 8px;
+            }
+        """)
+        impedance_toolbar_layout = QHBoxLayout(impedance_toolbar)
+
+        impedance_toolbar_layout.addWidget(QLabel("Parameter:"))
+        self.impedance_parameter_combo = QComboBox()
+        self.impedance_parameter_combo.addItems(IMPEDANCE_PARAMETERS)
+        self.impedance_parameter_combo.setCurrentText("S11")
+        self.impedance_parameter_combo.currentTextChanged.connect(self.refresh_impedance_table)
+        impedance_toolbar_layout.addWidget(self.impedance_parameter_combo)
+
+        impedance_toolbar_layout.addWidget(QLabel("Impedance Z = 50Ω × (1+Γ)/(1−Γ), Γ = reflection coefficient"))
+        self.impedance_cell_label = QLabel("Click a cell to see the value here.")
+        self.impedance_cell_label.setStyleSheet("""
+            QLabel {
+                color: #1B5E20;
+                background-color: #F1F8E9;
+                border: 1px solid #558B2F;
+                border-radius: 8px;
+                padding: 6px 10px;
+                font-weight: bold;
+            }
+        """)
+        impedance_toolbar_layout.addWidget(self.impedance_cell_label, stretch=1)
+        impedance_toolbar_layout.addStretch(1)
+
+        self.impedance_table_view = QTableView()
+        self.impedance_table_view.setAlternatingRowColors(False)
+        self.impedance_table_view.setStyleSheet("""
+            QTableView {
+                background-color: white;
+                gridline-color: #90A4AE;
+                font-size: 12px;
+            }
+            QHeaderView::section {
+                background-color: #2E7D32;
+                color: white;
+                padding: 4px;
+                border: 1px solid #388E3C;
+                font-weight: bold;
+            }
+        """)
+        self.impedance_tab = self.create_table_page(self.impedance_table_view, impedance_toolbar)
+        self.tabs.addTab(self.impedance_tab, "Impedance")
+
+        dz_toolbar = QFrame()
+        dz_toolbar.setStyleSheet("""
+            QFrame {
+                background-color: #FFF8E1;
+                border-radius: 10px;
+                padding: 8px;
+            }
+        """)
+        dz_toolbar_layout = QHBoxLayout(dz_toolbar)
+
+        dz_toolbar_layout.addWidget(QLabel("Mode:"))
+        self.dz_parameter_combo = QComboBox()
+        self.dz_parameter_combo.addItems(["S22 horizontal", "S22 vertical"])
+        self.dz_parameter_combo.setCurrentText("S22 horizontal")
+        self.dz_parameter_combo.currentTextChanged.connect(self.refresh_dz_table)
+        dz_toolbar_layout.addWidget(self.dz_parameter_combo)
+
+        dz_toolbar_layout.addWidget(QLabel("Delta impedance uses S22 only."))
+        self.dz_cell_label = QLabel("Click a cell to see the value here.")
+        self.dz_cell_label.setStyleSheet("""
+            QLabel {
+                color: #6D4C41;
+                background-color: #FFFDE7;
+                border: 1px solid #FFB300;
+                border-radius: 8px;
+                padding: 6px 10px;
+                font-weight: bold;
+            }
+        """)
+        dz_toolbar_layout.addWidget(self.dz_cell_label, stretch=1)
+        dz_toolbar_layout.addStretch(1)
+
+        self.dz_table_view = QTableView()
+        self.dz_table_view.setAlternatingRowColors(False)
+        self.dz_table_view.setMinimumHeight(240)
+        self.dz_table_view.setStyleSheet("""
+            QTableView {
+                background-color: white;
+                gridline-color: #90A4AE;
+                font-size: 12px;
+            }
+            QHeaderView::section {
+                background-color: #EF6C00;
+                color: white;
+                padding: 4px;
+                border: 1px solid #FB8C00;
+                font-weight: bold;
+            }
+        """)
+        self.dz_table_page = self.create_table_page(self.dz_table_view, dz_toolbar)
+
+        dz_plot_frame = QFrame()
+        dz_plot_frame.setStyleSheet("""
+            QFrame {
+                background-color: #FFF3E0;
+                border: 1px solid #FFCC80;
+                border-radius: 10px;
+            }
+        """)
+        dz_plot_layout = QVBoxLayout(dz_plot_frame)
+        dz_plot_layout.setContentsMargins(12, 12, 12, 12)
+
+        dz_plot_controls = QHBoxLayout()
+        dz_plot_controls.addWidget(QLabel("Good |ΔZ| ≤"))
+        self.dz_good_edit = QLineEdit("0.0001")
+        self.dz_good_edit.setFixedWidth(90)
+        self.dz_good_edit.setValidator(QDoubleValidator(0.0, 1e12, 6))
+        dz_plot_controls.addWidget(self.dz_good_edit)
+        dz_plot_controls.addWidget(QLabel("Poor |ΔZ| ≥"))
+        self.dz_poor_edit = QLineEdit("0.1")
+        self.dz_poor_edit.setFixedWidth(90)
+        self.dz_poor_edit.setValidator(QDoubleValidator(0.0, 1e12, 6))
+        dz_plot_controls.addWidget(self.dz_poor_edit)
+
+        self.dz_plot_button = QPushButton("Plot")
+        self.dz_plot_button.setMinimumHeight(34)
+        self.dz_plot_button.setStyleSheet("""
+            QPushButton {
+                background-color: #EF6C00;
+                color: white;
+                border-radius: 8px;
+                padding: 6px 24px;
+                font-size: 14px;
+                font-weight: bold;
+            }
+            QPushButton:hover { background-color: #E65100; }
+            QPushButton:pressed { background-color: #BF360C; }
+        """)
+        self.dz_plot_button.clicked.connect(self.plot_dz_resolution)
+        dz_plot_controls.addWidget(self.dz_plot_button)
+        dz_plot_controls.addStretch(1)
+        dz_plot_layout.addLayout(dz_plot_controls)
+
+        self.dz_status_label = QLabel("Press Plot to render horizontal and vertical delta-impedance maps.")
+        self.dz_status_label.setStyleSheet("font-size: 13px; color: #6D4C41; padding: 4px;")
+        dz_plot_layout.addWidget(self.dz_status_label)
+
+        if _MATPLOTLIB_OK:
+            self.dz_figure = Figure(figsize=(14, 6))
+            self.dz_canvas = FigureCanvas(self.dz_figure)
+            self.dz_canvas.setMinimumHeight(320)
+            dz_plot_layout.addWidget(self.dz_canvas)
+        else:
+            dz_plot_layout.addWidget(QLabel("matplotlib is not installed.\nRun: pip install matplotlib"))
+
+        self.dz_tab = QWidget()
+        dz_layout = QVBoxLayout(self.dz_tab)
+        self.dz_splitter = QSplitter(Qt.Vertical)
+        self.dz_splitter.addWidget(self.dz_table_page)
+        self.dz_splitter.addWidget(dz_plot_frame)
+        self.dz_splitter.setSizes([520, 220])
+        dz_layout.addWidget(self.dz_splitter)
+        self.tabs.addTab(self.dz_tab, "dZ")
+
+        smith_toolbar = QFrame()
+        smith_toolbar.setStyleSheet("""
+            QFrame {
+                background-color: #E3F2FD;
+                border-radius: 10px;
+                padding: 8px;
+            }
+        """)
+        smith_toolbar_layout = QHBoxLayout(smith_toolbar)
+
+        smith_toolbar_layout.addWidget(QLabel("Parameter:"))
+        self.smith_parameter_combo = QComboBox()
+        self.smith_parameter_combo.addItems(XY_PARAMETERS)
+        self.smith_parameter_combo.setCurrentText("S22")
+        self.smith_parameter_combo.currentTextChanged.connect(self.refresh_smith_chart)
+        smith_toolbar_layout.addWidget(self.smith_parameter_combo)
+        self.smith_conjugate_button = QPushButton("Conjugate")
+        self.smith_conjugate_button.setCheckable(True)
+        self.smith_conjugate_button.toggled.connect(self.toggle_smith_conjugate)
+        smith_toolbar_layout.addWidget(self.smith_conjugate_button)
+        smith_toolbar_layout.addWidget(QLabel("Plot X-Y table values on a Smith chart."))
+        self.smith_status_label = QLabel("Select data and press Convert.")
+        self.smith_status_label.setStyleSheet("""
+            QLabel {
+                color: #0D47A1;
+                background-color: #E8F4FD;
+                border: 1px solid #90CAF9;
+                border-radius: 8px;
+                padding: 6px 10px;
+                font-weight: bold;
+            }
+        """)
+        smith_toolbar_layout.addWidget(self.smith_status_label, stretch=1)
+        smith_toolbar_layout.addStretch(1)
+        self.smith_hover_label = QLabel("Hover a point to see impedance and C1/C2 position.")
+        self.smith_hover_label.setStyleSheet("""
+            QLabel {
+                color: #263238;
+                background-color: #E8F4FD;
+                border: 1px solid #90CAF9;
+                border-radius: 8px;
+                padding: 6px 10px;
+            }
+        """)
+        smith_toolbar_layout.addWidget(self.smith_hover_label, stretch=1)
+
+        self.smith_tab = QWidget()
+        smith_layout = QVBoxLayout(self.smith_tab)
+        smith_layout.addWidget(smith_toolbar)
+
+        if _MATPLOTLIB_OK:
+            self.smith_figure = Figure(figsize=(8, 8))
+            self.smith_canvas = FigureCanvas(self.smith_figure)
+            self.smith_canvas.setMinimumHeight(560)
+            self.smith_canvas.mpl_connect("motion_notify_event", self._on_smith_hover)
+            smith_layout.addWidget(self.smith_canvas, stretch=1)
+        else:
+            smith_layout.addWidget(QLabel("matplotlib is not installed.\nRun: pip install matplotlib"))
+
+        self.tabs.addTab(self.smith_tab, "Smith Chart")
+
+        self.component_tab = self._build_component_tab()
         self.reflection_tab = self.build_tab_page("Reflect Coefficient", self.placeholder_text("Reflect Coefficient"))
         self.vswr_tab = self.build_tab_page("VSWR", self.placeholder_text("VSWR"))
 
         self.tabs.addTab(self.component_tab, "Component")
-        self.tabs.addTab(self.impedance_tab, "Impedance")
         self.tabs.addTab(self.reflection_tab, "Reflect Coefficient")
         self.tabs.addTab(self.vswr_tab, "VSWR")
 
         main_layout.addWidget(self.tabs, stretch=1)
 
         note = QLabel(
-            "Note: Display tab shows the converted row table. X-Y Table shows the grid view for the selected S-parameter."
+            "Note: Display tab shows the converted row table. X-Y Table shows the grid view for the selected S-parameter. dZ shows delta impedance for S22. Smith Chart plots the selected X-Y data."
         )
         note.setAlignment(Qt.AlignCenter)
         note.setStyleSheet("font-size: 13px; color: #607D8B; padding: 6px;")
@@ -820,6 +1364,298 @@ class MatchResolutionGui(QMainWindow):
         layout.addWidget(title)
         layout.addWidget(body, stretch=1)
         return page
+
+    # ------------------------------------------------------------------
+    # Component tab
+    # ------------------------------------------------------------------
+    def _build_component_tab(self):
+        # Outer page holds only the scroll area so the tab itself never clips content.
+        outer = QWidget()
+        outer_layout = QVBoxLayout(outer)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        outer_layout.addWidget(scroll)
+
+        # Inner widget carries all real content.
+        page = QWidget()
+        root = QVBoxLayout(page)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(10)
+        scroll.setWidget(page)
+
+        # ── title ─────────────────────────────────────────────────────
+        title = QLabel("Component Analysis — Cap Array Resolution")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet("""
+            QLabel {
+                font-size: 20px; font-weight: bold; color: white;
+                background-color: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #2E7D32, stop:1 #1565C0);
+                padding: 10px; border-radius: 10px;
+            }
+        """)
+        root.addWidget(title)
+
+        # ── input form ────────────────────────────────────────────────
+        form_frame = QFrame()
+        form_frame.setStyleSheet("""
+            QFrame {
+                background-color: #F9FBE7;
+                border: 1px solid #C5CAE9;
+                border-radius: 10px;
+                padding: 8px;
+            }
+        """)
+        form_grid = QGridLayout(form_frame)
+        form_grid.setSpacing(6)
+        form_grid.setContentsMargins(14, 10, 14, 10)
+
+        label_style = "font-size: 13px;"
+        edit_style = """
+            QLineEdit {
+                background-color: white;
+                border: 1px solid #90A4AE;
+                border-radius: 4px;
+                padding: 3px 6px;
+                font-size: 13px;
+            }
+        """
+
+        def _lbl(text):
+            w = QLabel(text)
+            w.setStyleSheet(label_style)
+            return w
+
+        def _edit(default="0"):
+            e = QLineEdit(default)
+            e.setFixedWidth(90)
+            e.setStyleSheet(edit_style)
+            v = QDoubleValidator()
+            v.setBottom(0.0)
+            e.setValidator(v)
+            return e
+
+        # Row 0: Frequency
+        form_grid.addWidget(_lbl("Frequency"), 0, 0)
+        self.comp_freq_edit = _edit("13.56")
+        form_grid.addWidget(self.comp_freq_edit, 0, 1)
+        form_grid.addWidget(_lbl("MHz"), 0, 2)
+
+        # Row 1: blank spacer row
+        form_grid.setRowMinimumHeight(1, 6)
+
+        # Row 2: C1 / C2 section headers
+        c1_hdr = QLabel("C1")
+        c1_hdr.setStyleSheet("font-weight: bold; font-size: 14px; color: #1565C0;")
+        form_grid.addWidget(c1_hdr, 2, 0, 1, 3)
+
+        c2_hdr = QLabel("C2")
+        c2_hdr.setStyleSheet("font-weight: bold; font-size: 14px; color: #C62828;")
+        form_grid.addWidget(c2_hdr, 2, 4, 1, 3)
+
+        # Spacer column between C1 and C2 blocks
+        form_grid.setColumnMinimumWidth(3, 30)
+
+        # Rows 3-9: parameter rows
+        row_labels = ["Coarse 1 to 6", "Fine 6", "Fine 5", "Fine 4", "Fine 3", "Fine 2", "Fine 1"]
+        self.c1_edits = []
+        self.c2_edits = []
+        for idx, lbl_text in enumerate(row_labels):
+            r = 3 + idx
+            # C1
+            form_grid.addWidget(_lbl(lbl_text), r, 0)
+            e1 = _edit()
+            form_grid.addWidget(e1, r, 1)
+            form_grid.addWidget(_lbl("pF"), r, 2)
+            self.c1_edits.append(e1)
+            # C2
+            form_grid.addWidget(_lbl(lbl_text), r, 4)
+            e2 = _edit()
+            form_grid.addWidget(e2, r, 5)
+            form_grid.addWidget(_lbl("pF"), r, 6)
+            self.c2_edits.append(e2)
+
+        # Row 10: Calculate button
+        calc_btn = QPushButton("Calculate")
+        calc_btn.setMinimumHeight(36)
+        calc_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2E7D32; color: white;
+                border-radius: 8px; padding: 6px 28px;
+                font-size: 14px; font-weight: bold;
+            }
+            QPushButton:hover  { background-color: #1B5E20; }
+            QPushButton:pressed { background-color: #003300; }
+        """)
+        calc_btn.clicked.connect(self._on_calculate_component)
+        form_grid.addWidget(calc_btn, 10, 0, 1, 7, Qt.AlignCenter)
+
+        root.addWidget(form_frame)
+
+        # ── status label ──────────────────────────────────────────────
+        self.comp_status_label = QLabel("Enter cap values and press Calculate.")
+        self.comp_status_label.setAlignment(Qt.AlignCenter)
+        self.comp_status_label.setStyleSheet(
+            "font-size: 13px; color: #37474F; padding: 4px;"
+        )
+        root.addWidget(self.comp_status_label)
+
+        # ── plot canvas ───────────────────────────────────────────────
+        if _MATPLOTLIB_OK:
+            self.comp_figure = Figure(figsize=(14, 7))
+            self.comp_canvas = FigureCanvas(self.comp_figure)
+            self.comp_canvas.setMinimumHeight(500)
+            root.addWidget(self.comp_canvas)
+        else:
+            warn = QLabel(
+                "matplotlib is not installed.\n"
+                "Run: pip install matplotlib"
+            )
+            warn.setAlignment(Qt.AlignCenter)
+            warn.setStyleSheet("color: red; font-size: 14px;")
+            root.addWidget(warn)
+
+        root.addStretch(1)
+        return outer
+
+    def _on_calculate_component(self):
+        if not _MATPLOTLIB_OK:
+            QMessageBox.warning(
+                self, "Missing Library",
+                "matplotlib is required.\nInstall with:  pip install matplotlib"
+            )
+            return
+
+        try:
+            # c1_edits / c2_edits order: [0]=Coarse, [1]=Fine6, [2]=Fine5, ..., [6]=Fine1
+            def _read(edits):
+                coarse = float(edits[0].text() or "0")
+                # fine_caps for calculate_cap_array: [Fine1..Fine6] = indices [6,5,4,3,2,1]
+                fine_caps = [float(edits[6 - k].text() or "0") for k in range(6)]
+                return coarse, fine_caps
+
+            c1_coarse, c1_fine = _read(self.c1_edits)
+            c2_coarse, c2_fine = _read(self.c2_edits)
+
+            C1 = calculate_cap_array(c1_coarse, c1_fine)
+            C2 = calculate_cap_array(c2_coarse, c2_fine)
+
+            # Use absolute diff: negative values only appear at coarse-block
+            # boundaries (overlapping ranges) and don't represent useful resolution.
+            dC1 = np.abs(np.diff(C1))   # 447 values
+            dC2 = np.abs(np.diff(C2))
+
+            # Pad to 448 by repeating the last delta
+            dC1p = np.append(dC1, dC1[-1] if len(dC1) else 0.0)
+            dC2p = np.append(dC2, dC2[-1] if len(dC2) else 0.0)
+
+            positions = np.arange(448)
+            all_dc = np.concatenate([dC1, dC2])
+            min_dc, avg_dc, max_dc = all_dc.min(), all_dc.mean(), all_dc.max()
+
+            self.comp_status_label.setText(
+                f"C1: {C1.min():.4g} ~ {C1.max():.4g} pF  │  "
+                f"C2: {C2.min():.4g} ~ {C2.max():.4g} pF  │  "
+                f"ΔC → min = {min_dc:.4g} pF,  avg = {avg_dc:.4g} pF,  max = {max_dc:.4g} pF"
+            )
+
+            self._draw_component_plots(
+                C1, C2, dC1, dC2, dC1p, dC2p,
+                positions, min_dc, avg_dc, max_dc
+            )
+
+        except Exception as exc:
+            QMessageBox.critical(self, "Calculation Error", str(exc))
+
+    def _draw_component_plots(self, C1, C2, dC1, dC2, dC1p, dC2p,
+                               positions, min_dc, avg_dc, max_dc):
+        self.comp_figure.clear()
+
+        cmap_rygr = _get_cmap("RdYlGn_r")   # green=small ΔC (good), red=large (bad)
+
+        gs = self.comp_figure.add_gridspec(
+            2, 2,
+            hspace=0.42, wspace=0.32,
+            left=0.07, right=0.97, top=0.93, bottom=0.08
+        )
+        ax1 = self.comp_figure.add_subplot(gs[0, 0])
+        ax2 = self.comp_figure.add_subplot(gs[0, 1])
+        ax3 = self.comp_figure.add_subplot(gs[1, :])
+
+        # ── Plot 1: Equivalent Capacitance vs Position ────────────────
+        ax1.plot(positions, C1, color="#1565C0", linewidth=0.9, label="C1")
+        ax1.plot(positions, C2, color="#039BE5", linewidth=0.9,
+                 linestyle="--", label="C2")
+        ax1.set_xlabel("Position (0 – 447)", fontsize=9)
+        ax1.set_ylabel("Capacitance (pF)", fontsize=9)
+        ax1.set_title("Equivalent Capacitance vs Position", fontsize=10, fontweight="bold")
+        ax1.legend(fontsize=8)
+        ax1.grid(True, alpha=0.3)
+        ax1.tick_params(labelsize=8)
+
+        # ── Plot 2: ΔC vs Position (Green→Yellow→Red) ─────────────────
+        dc_pos = np.arange(len(dC1))
+        norm = Normalize(vmin=min_dc, vmax=max_dc)
+        colors1 = cmap_rygr(norm(dC1))
+        colors2 = cmap_rygr(norm(dC2))
+
+        ax2.scatter(dc_pos, dC1, c=colors1, s=5, label="C1", zorder=3)
+        ax2.scatter(dc_pos, dC2, c=colors2, s=5, marker="s", label="C2",
+                    alpha=0.7, zorder=2)
+
+        mappable = _mpl_cm.ScalarMappable(norm=norm, cmap=cmap_rygr)
+        mappable.set_array([])
+        self.comp_figure.colorbar(mappable, ax=ax2, label="|ΔC| (pF)", pad=0.02)
+
+        ax2.axhline(min_dc, color="green",  linewidth=0.8, linestyle="--",
+                    label=f"min {min_dc:.3g}")
+        ax2.axhline(avg_dc, color="orange", linewidth=0.8, linestyle="--",
+                    label=f"avg {avg_dc:.3g}")
+        ax2.axhline(max_dc, color="red",    linewidth=0.8, linestyle="--",
+                    label=f"max {max_dc:.3g}")
+
+        ax2.set_xlabel("Position (0 – 447)", fontsize=9)
+        ax2.set_ylabel("ΔC (pF)", fontsize=9)
+        ax2.set_title("ΔC vs Position  (resolution)", fontsize=10, fontweight="bold")
+        ax2.legend(fontsize=7, ncol=2)
+        ax2.grid(True, alpha=0.3)
+        ax2.tick_params(labelsize=8)
+
+        # ── Plot 3: Heatmap — x=C1 pos, y=C2 pos, color=min(ΔC1,ΔC2) ─
+        # At operating point (c1, c2), best achievable ΔC = min of individual deltas
+        heatmap = np.minimum(
+            dC1p[np.newaxis, :],   # broadcast over C2 axis  → shape (448, 448)
+            dC2p[:, np.newaxis]    # broadcast over C1 axis
+        )
+        im = ax3.imshow(
+            heatmap,
+            aspect="auto",
+            cmap=cmap_rygr,
+            origin="lower",
+            extent=[0, 448, 0, 448],
+            interpolation="nearest",
+        )
+        self.comp_figure.colorbar(im, ax=ax3, label="min(ΔC1, ΔC2)  (pF)", pad=0.01)
+        ax3.set_xlabel("C1 Position (0 – 447)", fontsize=9)
+        ax3.set_ylabel("C2 Position (0 – 447)", fontsize=9)
+        ax3.set_title(
+            "Resolution Heatmap: min(ΔC1, ΔC2) at each operating point  "
+            "[green = fine resolution, red = coarse]",
+            fontsize=10, fontweight="bold"
+        )
+        ax3.tick_params(labelsize=8)
+
+        # Coarse-boundary grid lines every 64 positions
+        for boundary in range(64, 448, 64):
+            ax3.axvline(boundary, color="white", linewidth=0.4, alpha=0.5)
+            ax3.axhline(boundary, color="white", linewidth=0.4, alpha=0.5)
+
+        self.comp_canvas.draw()
 
     def create_table_page(self, table_view, toolbar_widget=None):
         page = QWidget()
@@ -879,6 +1715,273 @@ class MatchResolutionGui(QMainWindow):
         else:
             self.xy_cell_label.setText(f"Row {row + 1}, Col {column + 1}: {value}")
 
+    def refresh_dz_table(self):
+        if self.df_all is None or self.df_all.empty:
+            return
+
+        self.current_dz_parameter = self.dz_parameter_combo.currentText().strip()
+        self.df_dz_display = build_delta_impedance_display_table(self.df_all, self.current_dz_parameter)
+
+        self.dz_table_model = PandasTableModel(self.df_dz_display)
+        self.dz_table_view.setModel(self.dz_table_model)
+        self.dz_table_view.horizontalHeader().setVisible(False)
+        self.dz_table_view.verticalHeader().setVisible(False)
+        self.dz_table_view.horizontalHeader().setSectionResizeMode(QHeaderView.Fixed)
+        self.dz_table_view.horizontalHeader().setDefaultSectionSize(80)
+        self.dz_table_view.verticalHeader().setDefaultSectionSize(24)
+        self.dz_table_view.setSelectionBehavior(QTableView.SelectItems)
+        self.dz_table_view.setSelectionMode(QTableView.SingleSelection)
+        selection_model = self.dz_table_view.selectionModel()
+        if selection_model is not None:
+            selection_model.currentChanged.connect(self.update_dz_cell_label)
+        self.dz_cell_label.setText("Click a cell to see the value here.")
+
+    def update_dz_cell_label(self, current, previous):
+        if not current.isValid() or self.df_dz_display is None:
+            self.dz_cell_label.setText("Click a cell to see the value here.")
+            return
+
+        row = current.row()
+        column = current.column()
+        if row >= len(self.df_dz_display.index) or column >= len(self.df_dz_display.columns):
+            self.dz_cell_label.setText("Click a cell to see the value here.")
+            return
+
+        value = self.df_dz_display.iat[row, column]
+        if value == "":
+            self.dz_cell_label.setText(f"Row {row + 1}, Col {column + 1}: empty")
+        else:
+            self.dz_cell_label.setText(f"Row {row + 1}, Col {column + 1}: {value}")
+
+    def refresh_impedance_table(self):
+        if self.df_all is None or self.df_all.empty:
+            return
+
+        self.current_impedance_parameter = self.impedance_parameter_combo.currentText().strip()
+        self.df_impedance_display = build_impedance_display_table(self.df_all, self.current_impedance_parameter)
+
+        self.impedance_table_model = PandasTableModel(self.df_impedance_display)
+        self.impedance_table_view.setModel(self.impedance_table_model)
+        self.impedance_table_view.horizontalHeader().setVisible(False)
+        self.impedance_table_view.verticalHeader().setVisible(False)
+        self.impedance_table_view.horizontalHeader().setSectionResizeMode(QHeaderView.Fixed)
+        self.impedance_table_view.horizontalHeader().setDefaultSectionSize(80)
+        self.impedance_table_view.verticalHeader().setDefaultSectionSize(24)
+        self.impedance_table_view.setSelectionBehavior(QTableView.SelectItems)
+        self.impedance_table_view.setSelectionMode(QTableView.SingleSelection)
+        selection_model = self.impedance_table_view.selectionModel()
+        if selection_model is not None:
+            selection_model.currentChanged.connect(self.update_impedance_cell_label)
+        self.impedance_cell_label.setText("Click a cell to see the value here.")
+
+    def update_impedance_cell_label(self, current, previous):
+        if not current.isValid() or self.df_impedance_display is None:
+            self.impedance_cell_label.setText("Click a cell to see the value here.")
+            return
+
+        row = current.row()
+        column = current.column()
+        if row >= len(self.df_impedance_display.index) or column >= len(self.df_impedance_display.columns):
+            self.impedance_cell_label.setText("Click a cell to see the value here.")
+            return
+
+        value = self.df_impedance_display.iat[row, column]
+        if value == "":
+            self.impedance_cell_label.setText(f"Row {row + 1}, Col {column + 1}: empty")
+        else:
+            self.impedance_cell_label.setText(f"Row {row + 1}, Col {column + 1}: {value}")
+
+    def refresh_smith_chart(self):
+        if self.df_all is None or self.df_all.empty:
+            return
+
+        self.current_smith_parameter = self.smith_parameter_combo.currentText().strip()
+        self.df_smith_points = build_smith_chart_plot_data(self.df_all, self.current_smith_parameter)
+
+        self.smith_status_label.setText(
+            f"{self.current_smith_parameter}: {len(self.df_smith_points):,} points"
+        )
+
+        self._draw_smith_chart(self.df_smith_points, self.current_smith_parameter)
+
+    def _draw_smith_chart(self, points, parameter_name):
+        if not _MATPLOTLIB_OK:
+            return
+
+        self.smith_figure.clear()
+        ax = self.smith_figure.add_subplot(111)
+        draw_smith_chart_grid(ax)
+
+        if points:
+            values = np.array([point["gamma"] for point in points], dtype=complex)
+            if self.smith_conjugate_button.isChecked():
+                values = np.conjugate(values)
+            self.smith_plot_values = values
+            self.smith_plot_points = points
+            colors = np.arange(len(values))
+            self.smith_scatter = ax.scatter(
+                values.real,
+                values.imag,
+                c=colors,
+                cmap="viridis",
+                s=14,
+                alpha=0.8,
+                edgecolors="none",
+                picker=True,
+            )
+        else:
+            self.smith_plot_values = np.array([], dtype=complex)
+            self.smith_plot_points = []
+            self.smith_scatter = None
+
+        ax.set_title(f"Smith Chart - {parameter_name}", fontsize=11, fontweight="bold")
+        self.smith_canvas.draw()
+
+    def toggle_smith_conjugate(self, checked):
+        self.smith_conjugate_button.setText("Conjugate On" if checked else "Conjugate")
+        if self.df_smith_points is not None:
+            self._draw_smith_chart(self.df_smith_points, self.current_smith_parameter)
+
+    def _format_smith_impedance_text(self, gamma_value):
+        z_value = reflect_to_impedance_value(gamma_value.real, gamma_value.imag)
+        if z_value is None:
+            return "Z=unavailable"
+
+        sign = "+" if z_value.imag >= 0 else "-"
+        return f"Z={z_value.real:.6g}{sign}{abs(z_value.imag):.6g}j"
+
+    def _format_smith_hover_text(self, point, gamma_value):
+        if point is None:
+            return "Hover a point to see impedance and C1/C2 position."
+
+        c1_text = position_label(point["x_c1"])
+        c2_text = position_label(point["y_c2"])
+        gamma_text = f"Γ={gamma_value.real:.6g}{'+' if gamma_value.imag >= 0 else '-'}{abs(gamma_value.imag):.6g}j"
+
+        if self.current_smith_parameter in IMPEDANCE_PARAMETERS:
+            impedance_text = self._format_smith_impedance_text(gamma_value)
+        else:
+            impedance_text = "Z=not available for this parameter"
+
+        return f"C1 {c1_text} | C2 {c2_text} | {gamma_text} | {impedance_text}"
+
+    def _on_smith_hover(self, event):
+        if not _MATPLOTLIB_OK or self.smith_scatter is None or event.inaxes is None:
+            return
+
+        contains, info = self.smith_scatter.contains(event)
+        indices = info.get("ind") if contains else []
+        if indices is None or len(indices) == 0:
+            self.smith_hover_label.setText("Hover a point to see impedance and C1/C2 position.")
+            return
+
+        index = int(indices[0])
+        if index < 0 or index >= len(self.smith_plot_points):
+            self.smith_hover_label.setText("Hover a point to see impedance and C1/C2 position.")
+            return
+
+        point = self.smith_plot_points[index]
+        gamma_value = self.smith_plot_values[index]
+        self.smith_hover_label.setText(self._format_smith_hover_text(point, gamma_value))
+
+    def plot_dz_resolution(self):
+        if not _MATPLOTLIB_OK:
+            QMessageBox.warning(
+                self, "Missing Library",
+                "matplotlib is required.\nInstall with:  pip install matplotlib"
+            )
+            return
+
+        if self.df_all is None or self.df_all.empty:
+            QMessageBox.warning(self, "No Data", "Please convert data before plotting.")
+            return
+
+        try:
+            good_threshold = float(self.dz_good_edit.text().strip() or "0")
+            poor_threshold = float(self.dz_poor_edit.text().strip() or "0")
+        except ValueError:
+            QMessageBox.warning(self, "Input Error", "Please enter numeric good and poor resolution values.")
+            return
+
+        if good_threshold <= 0 or poor_threshold <= 0 or good_threshold >= poor_threshold:
+            QMessageBox.warning(
+                self,
+                "Input Error",
+                "Good resolution must be positive and smaller than poor resolution."
+            )
+            return
+
+        horizontal, vertical, x_values, y_values = build_delta_impedance_plot_data(self.df_all)
+        horizontal_finite = horizontal[np.isfinite(horizontal)]
+        vertical_finite = vertical[np.isfinite(vertical)]
+
+        if horizontal_finite.size == 0 and vertical_finite.size == 0:
+            QMessageBox.warning(self, "No Data", "No delta-impedance values were available to plot.")
+            return
+
+        h_min = horizontal_finite.min() if horizontal_finite.size else 0.0
+        h_avg = horizontal_finite.mean() if horizontal_finite.size else 0.0
+        h_max = horizontal_finite.max() if horizontal_finite.size else 0.0
+        v_min = vertical_finite.min() if vertical_finite.size else 0.0
+        v_avg = vertical_finite.mean() if vertical_finite.size else 0.0
+        v_max = vertical_finite.max() if vertical_finite.size else 0.0
+
+        self.dz_status_label.setText(
+            f"Horizontal |ΔZ|: min {h_min:.4g} Ω, avg {h_avg:.4g} Ω, max {h_max:.4g} Ω | "
+            f"Vertical |ΔZ|: min {v_min:.4g} Ω, avg {v_avg:.4g} Ω, max {v_max:.4g} Ω"
+        )
+
+        self._draw_dz_plots(horizontal, vertical, x_values, y_values, good_threshold, poor_threshold)
+
+    def _draw_dz_plots(self, horizontal, vertical, x_values, y_values, good_threshold, poor_threshold):
+        self.dz_figure.clear()
+
+        cmap = _get_cmap("RdYlGn_r")
+        norm = Normalize(vmin=good_threshold, vmax=poor_threshold, clip=True)
+
+        gs = self.dz_figure.add_gridspec(1, 2, wspace=0.18, left=0.05, right=0.92, top=0.9, bottom=0.08)
+        ax_left = self.dz_figure.add_subplot(gs[0, 0])
+        ax_right = self.dz_figure.add_subplot(gs[0, 1])
+
+        left_im = ax_left.imshow(
+            horizontal,
+            aspect="auto",
+            origin="lower",
+            cmap=cmap,
+            norm=norm,
+            interpolation="nearest",
+            extent=[0, len(x_values), 0, len(y_values)],
+        )
+        ax_right.imshow(
+            vertical,
+            aspect="auto",
+            origin="lower",
+            cmap=cmap,
+            norm=norm,
+            interpolation="nearest",
+            extent=[0, len(x_values), 0, len(y_values)],
+        )
+
+        ax_left.set_title("Horizontal |ΔZ|", fontsize=11, fontweight="bold")
+        ax_right.set_title("Vertical |ΔZ|", fontsize=11, fontweight="bold")
+        for axis in (ax_left, ax_right):
+            axis.set_xlabel("C1 Position (0 - 447)", fontsize=9)
+            axis.set_ylabel("C2 Position (0 - 447)", fontsize=9)
+            axis.tick_params(labelsize=8)
+            for boundary in range(64, max(len(x_values), len(y_values)), 64):
+                axis.axvline(boundary, color="white", linewidth=0.35, alpha=0.5)
+                axis.axhline(boundary, color="white", linewidth=0.35, alpha=0.5)
+
+        colorbar = self.dz_figure.colorbar(left_im, ax=[ax_left, ax_right], pad=0.02)
+        colorbar.set_label("|ΔZ| (ohms)", fontsize=9)
+
+        self.dz_figure.suptitle(
+            f"Delta impedance resolution map  (green <= {good_threshold:g}, red >= {poor_threshold:g})",
+            fontsize=12,
+            fontweight="bold",
+        )
+        self.dz_canvas.draw()
+
     def placeholder_text(self, name):
         return (
             f"{name} will be added in step 2.\n\n"
@@ -914,6 +2017,9 @@ class MatchResolutionGui(QMainWindow):
             self.df_display = self.df_all.head(5000).copy()
             self.refresh_display_table()
             self.refresh_xy_table()
+            self.refresh_impedance_table()
+            self.refresh_dz_table()
+            self.refresh_smith_chart()
 
             total_rows = len(self.df_all)
             frequency_min = self.df_all["Frequency"].min()
@@ -945,7 +2051,10 @@ class MatchResolutionGui(QMainWindow):
                 self,
                 "Convert Finished",
                 f"Successfully converted {total_rows:,} rows.\n\n"
-                f"X-Y tab uses {self.current_xy_parameter}."
+            f"X-Y tab uses {self.current_xy_parameter}.\n"
+            f"Impedance tab uses {self.current_impedance_parameter}.\n"
+            f"dZ tab uses {self.current_dz_parameter}.\n"
+            f"Smith Chart uses {self.current_smith_parameter}."
             )
 
         except Exception as e:
@@ -960,10 +2069,13 @@ class MatchResolutionGui(QMainWindow):
         input_path = self.file_path_edit.text().strip()
         base_name = os.path.splitext(os.path.basename(input_path))[0]
         current_tab = self.tabs.tabText(self.tabs.currentIndex())
-        if current_tab == "X-Y Table" and self.df_xy_display is not None:
-            default_name = base_name + f"_{self.current_xy_parameter.lower()}_xy_table.csv"
+
+        if current_tab == "Impedance" and self.df_impedance_display is not None:
+            default_name = base_name + f"_{self.current_impedance_parameter.lower()}_impedance_table.csv"
+        elif current_tab == "dZ" and self.df_dz_display is not None:
+            default_name = base_name + f"_{self.current_dz_parameter.lower().replace(' ', '_')}_dz_table.csv"
         else:
-            default_name = base_name + "_display_table.csv"
+            default_name = base_name + f"_{self.current_xy_parameter.lower()}_xy_table.csv"
 
         save_path, _ = QFileDialog.getSaveFileName(
             self,
@@ -976,10 +2088,12 @@ class MatchResolutionGui(QMainWindow):
             return
 
         try:
-            if current_tab == "X-Y Table" and self.df_xy_display is not None:
+            if current_tab == "Impedance" and self.df_impedance_display is not None:
+                self.df_impedance_display.to_csv(save_path, index=False, header=False)
+            elif current_tab == "dZ" and self.df_dz_display is not None:
+                self.df_dz_display.to_csv(save_path, index=False, header=False)
+            elif self.df_xy_display is not None:
                 self.df_xy_display.to_csv(save_path, index=False, header=False)
-            elif self.df_display is not None:
-                self.df_display.to_csv(save_path, index=False)
             else:
                 self.df_all.to_csv(save_path, index=False)
             QMessageBox.information(
