@@ -56,10 +56,13 @@ EXPECTED_S_COLUMNS = [
 ]
 
 REQUIRED_TABLE_COLUMNS = ["Frequency", "CMD", *EXPECTED_S_COLUMNS]
+EXPANDED_CMD_COLUMNS = ["C1_coarse", "C1_fine", "C2_coarse", "C2_fine"]
+FULL_GRID_ROWS = 7 * 64 * 7 * 64
+REDUCED_GRID_ROWS = 7 * 8 * 7 * 8
 XY_PARAMETERS = ["S11", "S21", "S12", "S22"]
 IMPEDANCE_PARAMETERS = ["S11", "S22"]
 DEFAULT_Z0 = 50.0
-APP_VERSION = "V1.0.3"
+APP_VERSION = "V1.0.4"
 
 
 def is_float_text(text: str) -> bool:
@@ -134,20 +137,27 @@ def parse_full_row(tokens):
     Support row format like:
 
     1.29E+07 caps hf 0 0 0 0 1.31E-01 -2.52E-01 ...
+    1.29E+07 caps hf ps1 0 0 0 0 1.31E-01 -2.52E-01 ...
 
     Total tokens:
-        Frequency + caps + hf + 4 position values + 8 S-parameter values
-        1 + 2 + 4 + 8 = 15 tokens
+        Frequency + command section + 8 S-parameter values
+        command section may be either:
+            caps hf x1 x2 x3 x4
+        or:
+            caps hf ps1 x1 x2 x3 x4
     """
     if len(tokens) < 15:
         raise ValueError("Not enough columns for one full row.")
 
     frequency = float(tokens[0])
 
-    cmd_line = " ".join(tokens[1:7])
+    cmd_tokens = tokens[1:-8]
+    if len(cmd_tokens) < 6:
+        raise ValueError("Not enough command tokens in full row.")
+    cmd_line = " ".join(cmd_tokens)
     cmd_info = parse_cmd_line(cmd_line)
 
-    s_values = [float(v) for v in tokens[7:15]]
+    s_values = [float(v) for v in tokens[-8:]]
 
     row = {
         "Frequency": frequency,
@@ -219,36 +229,73 @@ def find_header_row(file_path):
     return None
 
 
-def build_table_from_dataframe(raw_df):
+def count_non_empty_data_lines(file_path, header_row):
+    non_empty_count = 0
+    with open(file_path, "r", encoding="utf-8-sig", errors="ignore") as f:
+        for index, line in enumerate(f):
+            if index <= header_row:
+                continue
+            if line.strip():
+                non_empty_count += 1
+    return non_empty_count
+
+
+def build_table_from_dataframe(raw_df, expected_data_rows=None):
     """
     Convert a CSV/TSV-style dataframe into the normalized X-Y table.
     """
     raw_df = raw_df.copy()
     raw_df.columns = [clean_column_name(column) for column in raw_df.columns]
+    raw_df = raw_df.dropna(how="all")
 
-    missing_columns = [column for column in REQUIRED_TABLE_COLUMNS if column not in raw_df.columns]
-    if missing_columns:
+    has_cmd_column = all(column in raw_df.columns for column in REQUIRED_TABLE_COLUMNS)
+    has_expanded_columns = (
+        "Frequency" in raw_df.columns
+        and all(column in raw_df.columns for column in EXPANDED_CMD_COLUMNS)
+        and all(column in raw_df.columns for column in EXPECTED_S_COLUMNS)
+    )
+    if not has_cmd_column and not has_expanded_columns:
         raise ValueError(
-            "Missing required columns: " + ", ".join(missing_columns)
+            "Missing required columns. Need either [Frequency, CMD, Sxx] or [Frequency, C1/C2 coarse/fine, Sxx]."
         )
 
     rows = []
     for record in raw_df.itertuples(index=False):
-        frequency = float(getattr(record, "Frequency"))
-        cmd_info = parse_cmd_line(str(getattr(record, "CMD")))
+        try:
+            frequency = float(getattr(record, "Frequency"))
+            if has_cmd_column:
+                cmd_info = parse_cmd_line(str(getattr(record, "CMD")))
+            else:
+                c1_coarse = int(float(getattr(record, "C1_coarse")))
+                c1_fine = int(float(getattr(record, "C1_fine")))
+                c2_coarse = int(float(getattr(record, "C2_coarse")))
+                c2_fine = int(float(getattr(record, "C2_fine")))
+                cmd_info = {
+                    "CMD_name": "caps",
+                    "Band": "hf",
+                    "C1_coarse": c1_coarse,
+                    "C1_fine": c1_fine,
+                    "C2_coarse": c2_coarse,
+                    "C2_fine": c2_fine,
+                    "X_C1": c1_coarse * 64 + c1_fine,
+                    "Y_C2": c2_coarse * 64 + c2_fine,
+                }
 
-        row = {
-            "Frequency": frequency,
-            **cmd_info,
-        }
+            row = {
+                "Frequency": frequency,
+                **cmd_info,
+            }
 
-        for column in EXPECTED_S_COLUMNS:
-            row[column] = float(getattr(record, column))
+            for column in EXPECTED_S_COLUMNS:
+                row[column] = float(getattr(record, column))
 
-        rows.append(row)
+            rows.append(row)
+        except Exception:
+            continue
 
     if not rows:
-        raise ValueError("No valid data rows found. Please check file format.")
+        row_hint = f" (file has {expected_data_rows:,} data lines)" if expected_data_rows else ""
+        raise ValueError(f"No valid data rows found. Please check file format.{row_hint}")
 
     df = pd.DataFrame(rows)
     return finalize_table(df)
@@ -305,6 +352,18 @@ def finalize_table(df):
     ]
 
 
+def extract_xy_axis_values(df):
+    """
+    Return sorted X/Y axis positions that actually exist in the input data.
+    Supports sparse/reduced fine-position formats.
+    """
+    x_values = sorted({int(value) for value in df["X_C1"].dropna().tolist()})
+    y_values = sorted({int(value) for value in df["Y_C2"].dropna().tolist()})
+    if not x_values or not y_values:
+        raise ValueError("X-Y table is empty.")
+    return x_values, y_values
+
+
 def build_xy_display_table(df, parameter_name):
     """
     Build a spreadsheet-like X-Y table with header rows and headers inside the grid.
@@ -315,13 +374,7 @@ def build_xy_display_table(df, parameter_name):
     if real_col not in df.columns or imag_col not in df.columns:
         raise ValueError(f"Missing columns for {parameter_name}.")
 
-    x_max = int(df["X_C1"].max())
-    y_max = int(df["Y_C2"].max())
-    x_values = list(range(x_max + 1))
-    y_values = list(range(y_max + 1))
-
-    if not x_values or not y_values:
-        raise ValueError("X-Y table is empty.")
+    x_values, y_values = extract_xy_axis_values(df)
 
     x_lookup = {value: index for index, value in enumerate(x_values)}
     y_lookup = {value: index for index, value in enumerate(y_values)}
@@ -397,13 +450,7 @@ def build_impedance_matrix(df, parameter_name, z0=DEFAULT_Z0):
     if real_col not in df.columns or imag_col not in df.columns:
         raise ValueError(f"Missing columns for {parameter_name}.")
 
-    x_max = int(df["X_C1"].max())
-    y_max = int(df["Y_C2"].max())
-    x_values = list(range(x_max + 1))
-    y_values = list(range(y_max + 1))
-
-    if not x_values or not y_values:
-        raise ValueError("Impedance table is empty.")
+    x_values, y_values = extract_xy_axis_values(df)
 
     x_lookup = {value: index for index, value in enumerate(x_values)}
     y_lookup = {value: index for index, value in enumerate(y_values)}
@@ -551,13 +598,7 @@ def build_reflection_coefficient_matrix(df, parameter_name):
     if real_col not in df.columns or imag_col not in df.columns:
         raise ValueError(f"Missing columns for {parameter_name}.")
 
-    x_max = int(df["X_C1"].max())
-    y_max = int(df["Y_C2"].max())
-    x_values = list(range(x_max + 1))
-    y_values = list(range(y_max + 1))
-
-    if not x_values or not y_values:
-        raise ValueError("Reflect coefficient table is empty.")
+    x_values, y_values = extract_xy_axis_values(df)
 
     x_lookup = {value: index for index, value in enumerate(x_values)}
     y_lookup = {value: index for index, value in enumerate(y_values)}
@@ -795,6 +836,10 @@ def parse_match_file(file_path):
     header_row = find_header_row(file_path)
 
     if header_row is not None:
+        data_line_count = count_non_empty_data_lines(file_path, header_row)
+        if data_line_count in (FULL_GRID_ROWS, REDUCED_GRID_ROWS):
+            print(f"Info: detected grid data lines = {data_line_count:,}.")
+
         with open(file_path, "r", encoding="utf-8-sig", errors="ignore") as f:
             header_line = None
             for index, line in enumerate(f):
@@ -805,19 +850,37 @@ def parse_match_file(file_path):
         delimiter = ","
         if header_line is not None and "\t" in header_line and "," not in header_line:
             delimiter = "\t"
+        header_columns = []
+        if header_line is not None:
+            if delimiter == "\t":
+                header_columns = [clean_column_name(token) for token in header_line.strip().split("\t")]
+            else:
+                header_columns = [clean_column_name(token) for token in header_line.strip().split(",")]
+            header_columns = [token for token in header_columns if token]
+        usecols = list(range(len(header_columns))) if header_columns else None
 
-        try:
-            raw_df = pd.read_csv(
-                file_path,
-                skiprows=header_row,
-                encoding="utf-8-sig",
-                sep=delimiter,
-                engine="python" if delimiter == "\t" else "c",
-            )
-            if len(raw_df.columns) > 1:
-                return build_table_from_dataframe(raw_df)
-        except Exception as exc:
-            print(f"Warning: CSV parser failed, falling back to legacy parser. Reason: {exc}")
+        csv_attempts = [
+            {"sep": delimiter, "engine": "python" if delimiter == "\t" else "c", "usecols": usecols},
+            {"sep": None, "engine": "python", "usecols": usecols},
+            {"sep": delimiter, "engine": "python" if delimiter == "\t" else "c", "usecols": None},
+        ]
+        for attempt in csv_attempts:
+            try:
+                raw_df = pd.read_csv(
+                    file_path,
+                    skiprows=header_row,
+                    encoding="utf-8-sig",
+                    sep=attempt["sep"],
+                    engine=attempt["engine"],
+                    usecols=attempt["usecols"],
+                )
+                if len(raw_df.columns) > 1:
+                    return build_table_from_dataframe(raw_df, expected_data_rows=data_line_count)
+            except Exception as exc:
+                print(
+                    f"Warning: CSV parser attempt failed (sep={attempt['sep']}, engine={attempt['engine']}, usecols={'header' if attempt['usecols'] is not None else 'all'}). "
+                    f"Reason: {exc}"
+                )
 
     with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
         raw_lines = [line.strip() for line in f if line.strip()]
@@ -1340,13 +1403,13 @@ class MatchResolutionGui(QMainWindow):
 
         dz_plot_controls = QHBoxLayout()
         dz_plot_controls.addWidget(QLabel("Good |ΔZ| ≤"))
-        self.dz_good_edit = QLineEdit("0.0001")
+        self.dz_good_edit = QLineEdit("0.001")
         self.dz_good_edit.setFixedWidth(90)
         self.dz_good_edit.setValidator(QDoubleValidator(0.0, 1e12, 6))
         self.dz_good_edit.editingFinished.connect(self._on_dz_threshold_changed)
         dz_plot_controls.addWidget(self.dz_good_edit)
         dz_plot_controls.addWidget(QLabel("Poor |ΔZ| ≥"))
-        self.dz_poor_edit = QLineEdit("0.1")
+        self.dz_poor_edit = QLineEdit("1")
         self.dz_poor_edit.setFixedWidth(90)
         self.dz_poor_edit.setValidator(QDoubleValidator(0.0, 1e12, 6))
         self.dz_poor_edit.editingFinished.connect(self._on_dz_threshold_changed)
@@ -1557,13 +1620,13 @@ class MatchResolutionGui(QMainWindow):
 
         reflection_plot_controls = QHBoxLayout()
         reflection_plot_controls.addWidget(QLabel("Good |ΔΓ| ≤"))
-        self.reflection_good_edit = QLineEdit("0.1")
+        self.reflection_good_edit = QLineEdit("0")
         self.reflection_good_edit.setFixedWidth(90)
         self.reflection_good_edit.setValidator(QDoubleValidator(0.0, 1e12, 6))
         self.reflection_good_edit.editingFinished.connect(self._on_reflection_threshold_changed)
         reflection_plot_controls.addWidget(self.reflection_good_edit)
         reflection_plot_controls.addWidget(QLabel("Poor |ΔΓ| ≥"))
-        self.reflection_poor_edit = QLineEdit("0.9")
+        self.reflection_poor_edit = QLineEdit("0.03")
         self.reflection_poor_edit.setFixedWidth(90)
         self.reflection_poor_edit.setValidator(QDoubleValidator(0.0, 1e12, 6))
         self.reflection_poor_edit.editingFinished.connect(self._on_reflection_threshold_changed)
@@ -2153,12 +2216,12 @@ class MatchResolutionGui(QMainWindow):
                 QMessageBox.warning(self, "Input Error", "Please enter numeric good and poor reflection values.")
             return None
 
-        if good_threshold <= 0 or poor_threshold <= 0 or good_threshold >= poor_threshold:
+        if good_threshold < 0 or poor_threshold <= 0 or good_threshold >= poor_threshold:
             if show_message:
                 QMessageBox.warning(
                     self,
                     "Input Error",
-                    "Good resolution must be positive and smaller than poor resolution."
+                    "Good resolution must be >= 0 and smaller than poor resolution."
                 )
             return None
 
@@ -2256,7 +2319,7 @@ class MatchResolutionGui(QMainWindow):
         if self.current_smith_mode == "dz":
             thresholds = self._get_dz_thresholds(show_message=False)
             if thresholds is None:
-                good_threshold, poor_threshold = 0.0001, 0.1
+                good_threshold, poor_threshold = 0.001, 1.0
             else:
                 good_threshold, poor_threshold = thresholds
             dz_count = sum(
@@ -2269,7 +2332,7 @@ class MatchResolutionGui(QMainWindow):
         elif self.current_smith_mode == "dgamma":
             thresholds = self._get_reflection_thresholds(show_message=False)
             if thresholds is None:
-                good_threshold, poor_threshold = 0.1, 0.9
+                good_threshold, poor_threshold = 0.0, 0.03
             else:
                 good_threshold, poor_threshold = thresholds
             dgamma_count = sum(
@@ -2349,7 +2412,7 @@ class MatchResolutionGui(QMainWindow):
                     if thresholds is not None:
                         good_threshold, poor_threshold = thresholds
                     else:
-                        good_threshold, poor_threshold = 0.0001, 0.1
+                        good_threshold, poor_threshold = 0.001, 1.0
                     plotted_values = np.where(finite_mask, dz_values, good_threshold)
                     self.smith_scatter = ax.scatter(
                         values.real,
@@ -2394,7 +2457,7 @@ class MatchResolutionGui(QMainWindow):
                     if thresholds is not None:
                         good_threshold, poor_threshold = thresholds
                     else:
-                        good_threshold, poor_threshold = 0.1, 0.9
+                        good_threshold, poor_threshold = 0.0, 0.03
                     plotted_values = np.where(finite_mask, dgamma_values, good_threshold)
                     self.smith_scatter = ax.scatter(
                         values.real,
