@@ -1,5 +1,9 @@
 # Changelog
 
+## V1.0.6
+
+- Switched application version to load from the root `VERSION` file so releases only require changing one version source.
+
 ## V1.0.5
 
 - Replaced VSWR tab with Efficiency tab showing power transmission efficiency η = (1 - |S11|²) × |S21|²

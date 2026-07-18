@@ -62,7 +62,13 @@ REDUCED_GRID_ROWS = 7 * 8 * 7 * 8
 XY_PARAMETERS = ["S11", "S21", "S12", "S22"]
 IMPEDANCE_PARAMETERS = ["S11", "S22"]
 DEFAULT_Z0 = 50.0
-APP_VERSION = "V1.0.4"
+_BASE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+VERSION_FILE = os.path.join(_BASE_DIR, "VERSION")
+with open(VERSION_FILE, encoding="utf-8") as version_file:
+    _version_text = version_file.read().strip()
+if not _version_text:
+    raise ValueError(f"VERSION file is empty: {VERSION_FILE}")
+APP_VERSION = _version_text if _version_text.upper().startswith("V") else f"V{_version_text}"
 
 
 def is_float_text(text: str) -> bool:
@@ -419,6 +425,70 @@ def reflect_to_impedance_value(s_r, s_x, z0=DEFAULT_Z0):
     return z0 * (1.0 + gamma) / denom
 
 
+def impedance_to_reflection_value(z_r, z_x, z0=DEFAULT_Z0):
+    """Convert impedance (R + jX) to a reflection coefficient."""
+    if pd.isna(z_r) or pd.isna(z_x):
+        return None
+
+    z = complex(z_r, z_x)
+    denom = z + z0
+    if abs(denom) < 1e-12:
+        return None
+
+    return (z - z0) / denom
+
+
+def format_impedance_text(z_value):
+    if z_value is None:
+        return ""
+
+    sign = "+" if z_value.imag >= 0 else "-"
+    return f"{z_value.real:.6g}{sign}{abs(z_value.imag):.6g}j"
+
+
+def find_nearest_load_impedance(df, c1_pct, c2_pct, parameter_name="S22", conjugate=False):
+    real_col = f"{parameter_name}_r"
+    imag_col = f"{parameter_name}_x"
+
+    if real_col not in df.columns or imag_col not in df.columns:
+        raise ValueError(f"Missing columns for {parameter_name}.")
+
+    candidates = df[["X_C1", "Y_C2", real_col, imag_col]].dropna().copy()
+    if candidates.empty:
+        raise ValueError("No impedance data available.")
+
+    x_max = float(candidates["X_C1"].max())
+    y_max = float(candidates["Y_C2"].max())
+    if x_max <= 0 or y_max <= 0:
+        raise ValueError("Unable to resolve percentage positions from the loaded data.")
+
+    candidates["X_pct"] = candidates["X_C1"] / x_max * 100.0
+    candidates["Y_pct"] = candidates["Y_C2"] / y_max * 100.0
+    candidates["distance"] = (candidates["X_pct"] - c1_pct) ** 2 + (candidates["Y_pct"] - c2_pct) ** 2
+    best_row = candidates.sort_values(["distance", "X_C1", "Y_C2"]).iloc[0]
+
+    gamma = complex(best_row[real_col], best_row[imag_col])
+    if conjugate:
+        gamma = np.conjugate(gamma)
+    impedance = reflect_to_impedance_value(gamma.real, gamma.imag)
+    if impedance is None:
+        raise ValueError("Unable to calculate load impedance at the selected position.")
+
+    return {
+        "requested_c1_pct": float(c1_pct),
+        "requested_c2_pct": float(c2_pct),
+        "x_c1": int(best_row["X_C1"]),
+        "y_c2": int(best_row["Y_C2"]),
+        "x_c1_pct": float(best_row["X_pct"]),
+        "y_c2_pct": float(best_row["Y_pct"]),
+        "gamma": gamma,
+        "impedance": impedance,
+        "distance": float(np.sqrt(best_row["distance"])),
+        "exact_match": abs(float(best_row["X_pct"]) - float(c1_pct)) < 1e-12 and abs(float(best_row["Y_pct"]) - float(c2_pct)) < 1e-12,
+        "parameter_name": parameter_name,
+    }
+
+
 def reflect_to_impedance_text(s_r, s_x, z0=DEFAULT_Z0):
     """Convert reflection coefficient (S_r + j*S_x) to impedance text."""
     z = reflect_to_impedance_value(s_r, s_x, z0)
@@ -680,10 +750,9 @@ def build_reflection_display_table(df, parameter_name, orientation):
     return pd.DataFrame(presentation_rows)
 
 
-def build_efficiency_display_table(df):
+def build_efficiency_display_table(df, efficiency_mode):
     """
     Build a spreadsheet-like X-Y table showing efficiency values.
-    Efficiency η = (1 - |S11|²) × |S21|²
     """
     s11_r_col = "S11_r"
     s11_x_col = "S11_x"
@@ -715,12 +784,22 @@ def build_efficiency_display_table(df):
         s21 = complex(s21_real, s21_imag)
         s11_magnitude = abs(s11)
         s21_magnitude = abs(s21)
-        efficiency = (1.0 - (s11_magnitude ** 2)) * (s21_magnitude ** 2)
+        if efficiency_mode == "overall":
+            efficiency = (1.0 - (s11_magnitude ** 2)) * (s21_magnitude ** 2)
+        elif efficiency_mode == "s21_squared":
+            efficiency = s21_magnitude ** 2
+        else:
+            raise ValueError(f"Unknown efficiency mode: {efficiency_mode}")
         grid[y_lookup[y_pos]][x_lookup[x_pos]] = f"{efficiency:.4f}"
+
+    if efficiency_mode == "overall":
+        mode_label = "ηoverall = (1 - |S11|²) × |S21|²"
+    else:
+        mode_label = "|S21|²"
 
     presentation_rows = []
     presentation_rows.append(["", "", "c1 coarse"] + [str(x // 64) for x in x_values])
-    presentation_rows.append(["", "Efficiency(S11,S21)", "c1 fine"] + [str(x % 64) for x in x_values])
+    presentation_rows.append(["", f"Efficiency({mode_label})", "c1 fine"] + [str(x % 64) for x in x_values])
     presentation_rows.append(["C2 coarse", "c2 fine", "percentage"] + [f"{(x / x_denominator) * 100:.2f}%" for x in x_values])
 
     for y_index, y_value in enumerate(y_values):
@@ -1091,6 +1170,101 @@ class PandasTableModel(QAbstractTableModel):
         return None
 
 
+class ManualImpedanceTableModel(QAbstractTableModel):
+    def __init__(self, row_count=5):
+        super().__init__()
+        self.df = pd.DataFrame({"R": ["" for _ in range(row_count)], "X": ["" for _ in range(row_count)]})
+
+    def rowCount(self, parent=QModelIndex()):
+        return len(self.df)
+
+    def columnCount(self, parent=QModelIndex()):
+        return 3
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid():
+            return None
+
+        row = index.row()
+        col = index.column()
+
+        if role == Qt.DisplayRole or role == Qt.EditRole:
+            if col == 0:
+                return str(row + 1)
+            value = self.df.iat[row, col - 1]
+            return "" if pd.isna(value) else str(value)
+
+        if role == Qt.TextAlignmentRole:
+            return Qt.AlignCenter
+
+        return None
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if role == Qt.DisplayRole and orientation == Qt.Horizontal:
+            return ["ID", "R", "X"][section]
+        if role == Qt.DisplayRole and orientation == Qt.Vertical:
+            return str(section + 1)
+        if role == Qt.FontRole and orientation == Qt.Horizontal:
+            font = QFont()
+            font.setBold(True)
+            return font
+        return None
+
+    def flags(self, index):
+        if not index.isValid():
+            return Qt.ItemIsEnabled
+        if index.column() == 0:
+            return Qt.ItemIsEnabled | Qt.ItemIsSelectable
+        return Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable
+
+    def setData(self, index, value, role=Qt.EditRole):
+        if role != Qt.EditRole or not index.isValid() or index.column() == 0:
+            return False
+
+        text = str(value).strip()
+        self.df.iat[index.row(), index.column() - 1] = text
+        self.dataChanged.emit(index, index, [Qt.DisplayRole, Qt.EditRole])
+        return True
+
+    def add_blank_row(self):
+        self.beginInsertRows(QModelIndex(), len(self.df), len(self.df))
+        self.df = pd.concat([self.df, pd.DataFrame([{"R": "", "X": ""}])], ignore_index=True)
+        self.endInsertRows()
+
+    def clear_values(self):
+        self.beginResetModel()
+        self.df = pd.DataFrame({"R": ["" for _ in range(len(self.df))], "X": ["" for _ in range(len(self.df))]})
+        self.endResetModel()
+
+    def set_next_available_point(self, r_value, x_value):
+        target_row = None
+        for row_index, row in self.df.iterrows():
+            if str(row["R"]).strip() == "" and str(row["X"]).strip() == "":
+                target_row = row_index
+                break
+
+        if target_row is None:
+            self.add_blank_row()
+            target_row = len(self.df) - 1
+
+        self.df.iat[target_row, 0] = f"{r_value:.6g}"
+        self.df.iat[target_row, 1] = f"{x_value:.6g}"
+        left = self.index(target_row, 1)
+        right = self.index(target_row, 2)
+        self.dataChanged.emit(left, right, [Qt.DisplayRole, Qt.EditRole])
+        return target_row + 1
+
+    def iter_points(self):
+        for row_index, row in self.df.iterrows():
+            r_text = str(row["R"]).strip()
+            x_text = str(row["X"]).strip()
+            if not r_text or not x_text:
+                continue
+            if not is_float_text(r_text) or not is_float_text(x_text):
+                continue
+            yield row_index + 1, float(r_text), float(x_text)
+
+
 class MatchResolutionGui(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1103,13 +1277,17 @@ class MatchResolutionGui(QMainWindow):
         self.df_xy_display = None
         self.current_xy_parameter = "S22"
         self.df_impedance_display = None
-        self.current_impedance_parameter = "S11"
+        self.current_impedance_parameter = "S22"
         self.df_dz_display = None
         self.current_dz_parameter = "S22 horizontal"
         self.df_reflection_display = None
         self.current_reflection_parameter = "S22"
         self.current_reflection_mode = "horizontal"
         self.df_efficiency_display = None
+        self.current_efficiency_mode = "s21_squared"
+        self.smith_manual_points = []
+        self.smith_search_result = None
+        self.manual_impedance_model = None
         self.df_smith_points = None
         self.current_smith_parameter = "S22"
         self.smith_plot_points = []
@@ -1397,7 +1575,7 @@ class MatchResolutionGui(QMainWindow):
         impedance_toolbar_layout.addWidget(QLabel("Parameter:"))
         self.impedance_parameter_combo = QComboBox()
         self.impedance_parameter_combo.addItems(IMPEDANCE_PARAMETERS)
-        self.impedance_parameter_combo.setCurrentText("S11")
+        self.impedance_parameter_combo.setCurrentText("S22")
         self.impedance_parameter_combo.currentTextChanged.connect(self.refresh_impedance_table)
         impedance_toolbar_layout.addWidget(self.impedance_parameter_combo)
 
@@ -1627,19 +1805,177 @@ class MatchResolutionGui(QMainWindow):
         self.smith_mode_xy_radio.setChecked(True)
         smith_mode_layout.addStretch(1)
 
+        smith_tools_frame = QFrame()
+        smith_tools_frame.setStyleSheet("""
+            QFrame {
+                background-color: #F7FBFF;
+                border: 1px solid #C8E6FF;
+                border-radius: 10px;
+                padding: 8px;
+            }
+        """)
+        smith_tools_layout = QHBoxLayout(smith_tools_frame)
+
+        manual_frame = QFrame()
+        manual_frame.setStyleSheet("""
+            QFrame {
+                background-color: #FFFFFF;
+                border: 1px solid #BBDEFB;
+                border-radius: 8px;
+                padding: 6px;
+            }
+        """)
+        manual_layout = QVBoxLayout(manual_frame)
+        manual_layout.setContentsMargins(6, 4, 6, 4)
+        manual_layout.setSpacing(4)
+        manual_title = QLabel("Manual impedance points (R/X in ohms)")
+        manual_title.setMinimumHeight(48)
+        manual_title.setMaximumHeight(54)
+        manual_title.setWordWrap(True)
+        manual_title.setStyleSheet("font-size: 14px; font-weight: bold; color: #0D47A1;")
+        manual_layout.addWidget(manual_title)
+        self.manual_impedance_model = ManualImpedanceTableModel(5)
+        self.manual_impedance_table_view = QTableView()
+        self.manual_impedance_table_view.setModel(self.manual_impedance_model)
+        self.manual_impedance_table_view.setMinimumWidth(180)
+        self.manual_impedance_table_view.setMaximumWidth(240)
+        self.manual_impedance_table_view.setFixedHeight(176)
+        self.manual_impedance_table_view.horizontalHeader().setSectionResizeMode(QHeaderView.Fixed)
+        self.manual_impedance_table_view.horizontalHeader().setMinimumHeight(34)
+        self.manual_impedance_table_view.horizontalHeader().setStyleSheet("font-size: 13px; font-weight: bold;")
+        self.manual_impedance_table_view.verticalHeader().setDefaultSectionSize(24)
+        self.manual_impedance_table_view.setColumnWidth(0, 36)
+        self.manual_impedance_table_view.setColumnWidth(1, 68)
+        self.manual_impedance_table_view.setColumnWidth(2, 68)
+        self.manual_impedance_table_view.verticalHeader().setVisible(False)
+        self.manual_impedance_table_view.setSelectionBehavior(QTableView.SelectItems)
+        self.manual_impedance_table_view.setSelectionMode(QTableView.SingleSelection)
+        manual_layout.addWidget(self.manual_impedance_table_view)
+
+        manual_button_row = QHBoxLayout()
+        self.manual_plot_button = QPushButton("Plot Points")
+        self.manual_plot_button.clicked.connect(self._plot_manual_impedance_points)
+        manual_button_row.addWidget(self.manual_plot_button)
+        self.manual_add_row_button = QPushButton("Add Row")
+        self.manual_add_row_button.clicked.connect(self._add_manual_impedance_row)
+        manual_button_row.addWidget(self.manual_add_row_button)
+        self.manual_clear_button = QPushButton("Clear")
+        self.manual_clear_button.clicked.connect(self._clear_manual_impedance_points)
+        manual_button_row.addWidget(self.manual_clear_button)
+        manual_button_row.addStretch(1)
+        manual_layout.addLayout(manual_button_row)
+
+        self.manual_impedance_status_label = QLabel("Enter R and X, then plot the points on the Smith chart.")
+        self.manual_impedance_status_label.setWordWrap(True)
+        self.manual_impedance_status_label.setStyleSheet("color: #0D47A1;")
+        manual_layout.addWidget(self.manual_impedance_status_label)
+
+        search_frame = QFrame()
+        search_frame.setStyleSheet("""
+            QFrame {
+                background-color: #FFFFFF;
+                border: 1px solid #BBDEFB;
+                border-radius: 8px;
+                padding: 6px;
+            }
+        """)
+        search_layout = QVBoxLayout(search_frame)
+        search_layout.addWidget(QLabel("Search load impedance by C1% / C2%"))
+        search_grid = QGridLayout()
+        search_grid.addWidget(QLabel("C1%"), 0, 0)
+        self.zl_search_c1_edit = QLineEdit()
+        self.zl_search_c1_edit.setFixedWidth(60)
+        self.zl_search_c1_edit.setValidator(QDoubleValidator(0.0, 100.0, 2))
+        search_grid.addWidget(self.zl_search_c1_edit, 0, 1)
+        search_grid.addWidget(QLabel("C2%"), 0, 2)
+        self.zl_search_c2_edit = QLineEdit()
+        self.zl_search_c2_edit.setFixedWidth(60)
+        self.zl_search_c2_edit.setValidator(QDoubleValidator(0.0, 100.0, 2))
+        search_grid.addWidget(self.zl_search_c2_edit, 0, 3)
+        self.zl_search_button = QPushButton("Search ZL")
+        self.zl_search_button.clicked.connect(self._search_load_impedance)
+        search_grid.addWidget(self.zl_search_button, 0, 4)
+        search_layout.addLayout(search_grid)
+        search_carry_row = QHBoxLayout()
+        self.manual_carry_button = QPushButton("Carry Over")
+        self.manual_carry_button.clicked.connect(self._carry_over_search_result)
+        search_carry_row.addWidget(self.manual_carry_button)
+        search_carry_row.addStretch(1)
+        search_layout.addLayout(search_carry_row)
+        self.zl_search_result_label = QLabel("ZL search result will appear here.")
+        self.zl_search_result_label.setWordWrap(True)
+        self.zl_search_result_label.setStyleSheet("""
+            QLabel {
+                color: #1B5E20;
+                background-color: #E8F5E9;
+                border: 1px solid #A5D6A7;
+                border-radius: 8px;
+                padding: 6px 10px;
+            }
+        """)
+        search_layout.addWidget(self.zl_search_result_label)
+
+        manual_frame.setMaximumWidth(360)
+        search_frame.setMaximumWidth(280)
+        smith_tools_stack = QWidget()
+        smith_tools_stack_layout = QVBoxLayout(smith_tools_stack)
+        smith_tools_stack_layout.setContentsMargins(0, 0, 0, 0)
+        smith_tools_stack_layout.setSpacing(8)
+        smith_tools_stack_layout.addWidget(manual_frame)
+        smith_tools_stack_layout.addWidget(search_frame)
+        smith_tools_stack_layout.addStretch(1)
+        smith_tools_layout.addWidget(smith_tools_stack)
+
         self.smith_tab = QWidget()
         smith_layout = QVBoxLayout(self.smith_tab)
-        smith_layout.addWidget(smith_toolbar)
-        smith_layout.addWidget(smith_mode_frame)
+
+        left_panel = QWidget()
+        left_panel_layout = QVBoxLayout(left_panel)
+        left_panel_layout.setContentsMargins(0, 0, 0, 0)
+        left_panel_layout.addWidget(smith_toolbar)
+        left_panel_layout.addWidget(smith_mode_frame)
+        left_panel_layout.addWidget(smith_tools_frame)
+        left_panel_layout.addStretch(1)
+
+        self.smith_left_scroll = QScrollArea()
+        self.smith_left_scroll.setWidgetResizable(True)
+        self.smith_left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.smith_left_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.smith_left_scroll.setWidget(left_panel)
+        self.smith_left_scroll.setMaximumWidth(720)
+
+        right_panel = QWidget()
+        right_panel_layout = QVBoxLayout(right_panel)
+        right_panel_layout.setContentsMargins(0, 0, 0, 0)
 
         if _MATPLOTLIB_OK:
             self.smith_figure = Figure(figsize=(8, 8))
             self.smith_canvas = FigureCanvas(self.smith_figure)
-            self.smith_canvas.setMinimumHeight(560)
+            self.smith_canvas.setMinimumSize(780, 780)
             self.smith_canvas.mpl_connect("motion_notify_event", self._on_smith_hover)
-            smith_layout.addWidget(self.smith_canvas, stretch=1)
+            right_panel_layout.addWidget(self.smith_canvas)
         else:
-            smith_layout.addWidget(QLabel("matplotlib is not installed.\nRun: pip install matplotlib"))
+            right_panel_layout.addWidget(QLabel("matplotlib is not installed.\nRun: pip install matplotlib"))
+        right_panel_layout.addStretch(1)
+
+        self.smith_chart_scroll = QScrollArea()
+        self.smith_chart_scroll.setWidgetResizable(False)
+        self.smith_chart_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.smith_chart_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.smith_chart_scroll.setWidget(right_panel)
+
+        smith_splitter = QSplitter(Qt.Horizontal)
+        smith_splitter.addWidget(self.smith_left_scroll)
+        smith_splitter.addWidget(self.smith_chart_scroll)
+        smith_splitter.setHandleWidth(10)
+        smith_splitter.setStretchFactor(0, 0)
+        smith_splitter.setStretchFactor(1, 1)
+        smith_splitter.setSizes([520, 900])
+        smith_splitter.setCollapsible(0, False)
+        smith_splitter.setCollapsible(1, False)
+        smith_layout.addWidget(smith_splitter, stretch=1)
+
+        self.smith_conjugate_button.setChecked(True)
 
         self.tabs.addTab(self.smith_tab, "Smith Chart")
 
@@ -1777,7 +2113,14 @@ class MatchResolutionGui(QMainWindow):
         """)
         efficiency_toolbar_layout = QHBoxLayout(efficiency_toolbar)
 
-        efficiency_toolbar_layout.addWidget(QLabel("Efficiency η = (1 - |S11|²) × |S21|² (Power transmission efficiency)"))
+        efficiency_toolbar_layout.addWidget(QLabel("Formula:"))
+        self.efficiency_mode_combo = QComboBox()
+        self.efficiency_mode_combo.addItem("|S21|²", "s21_squared")
+        self.efficiency_mode_combo.addItem("ηoverall = (1 - |S11|²) × |S21|²", "overall")
+        self.efficiency_mode_combo.setCurrentIndex(0)
+        self.efficiency_mode_combo.currentTextChanged.connect(lambda *_: self.refresh_efficiency_table())
+        efficiency_toolbar_layout.addWidget(self.efficiency_mode_combo)
+        efficiency_toolbar_layout.addWidget(QLabel("Power transmission efficiency table"))
         self.efficiency_cell_label = QLabel("Click a cell to see the value here.")
         self.efficiency_cell_label.setStyleSheet("""
             QLabel {
@@ -1861,7 +2204,7 @@ class MatchResolutionGui(QMainWindow):
         main_layout.addWidget(self.tabs, stretch=1)
 
         note = QLabel(
-            "Note: Display tab shows the converted row table. X-Y Table shows the grid view for the selected S-parameter. dZ shows delta impedance for S22. Reflect Coefficient tab shows delta-Γ resolution from X-Y data. Efficiency tab shows power transmission efficiency η = (1 - |S11|²) × |S21|². Smith Chart supports X-Y Table, dZ, dΓ, and Efficiency coloring modes."
+            "Note: Display tab shows the converted row table. X-Y Table shows the grid view for the selected S-parameter. dZ shows delta impedance for S22. Reflect Coefficient tab shows delta-Γ resolution from X-Y data. Efficiency tab lets you switch between |S21|² and ηoverall = (1 - |S11|²) × |S21|². Smith Chart supports X-Y Table, dZ, dΓ, Efficiency coloring modes, manual R/X points, and ZL search by C1/C2."
         )
         note.setAlignment(Qt.AlignCenter)
         note.setStyleSheet("font-size: 13px; color: #607D8B; padding: 6px;")
@@ -2386,7 +2729,8 @@ class MatchResolutionGui(QMainWindow):
         if self.df_all is None or self.df_all.empty:
             return
 
-        self.df_efficiency_display = build_efficiency_display_table(self.df_all)
+        self.current_efficiency_mode = self.efficiency_mode_combo.currentData()
+        self.df_efficiency_display = build_efficiency_display_table(self.df_all, self.current_efficiency_mode)
 
         self.efficiency_table_model = PandasTableModel(self.df_efficiency_display)
         self.efficiency_table_view.setModel(self.efficiency_table_model)
@@ -2554,6 +2898,11 @@ class MatchResolutionGui(QMainWindow):
 
     def refresh_smith_chart(self):
         if self.df_all is None or self.df_all.empty:
+            self.df_smith_points = []
+            self.smith_plot_points = []
+            self.smith_plot_values = np.array([], dtype=complex)
+            if _MATPLOTLIB_OK:
+                self._draw_smith_chart([], self.current_smith_parameter)
             return
 
         self.current_smith_parameter = self.smith_parameter_combo.currentText().strip()
@@ -2621,6 +2970,110 @@ class MatchResolutionGui(QMainWindow):
         self.current_smith_mode = mode_name
         if self.df_all is not None and not self.df_all.empty:
             self.refresh_smith_chart()
+
+    def _add_manual_impedance_row(self):
+        if self.manual_impedance_model is None:
+            return
+        self.manual_impedance_model.add_blank_row()
+
+    def _clear_manual_impedance_points(self):
+        if self.manual_impedance_model is None:
+            return
+        self.manual_impedance_model.clear_values()
+        self.smith_manual_points = []
+        self.manual_impedance_status_label.setText("Manual impedance points cleared.")
+        if _MATPLOTLIB_OK:
+            self._draw_smith_chart(self.df_smith_points or [], self.current_smith_parameter)
+
+    def _carry_over_search_result(self):
+        if self.manual_impedance_model is None:
+            return
+
+        if self.smith_search_result is None:
+            QMessageBox.warning(self, "No Search Result", "Run Search ZL first before carrying over a value.")
+            return
+
+        impedance = self.smith_search_result.get("impedance")
+        if impedance is None:
+            QMessageBox.warning(self, "No Search Result", "The current search result does not have a valid impedance.")
+            return
+
+        row_number = self.manual_impedance_model.set_next_available_point(impedance.real, impedance.imag)
+        self.manual_impedance_status_label.setText(
+            f"Carried ZL = {format_impedance_text(impedance)} into manual row {row_number}."
+        )
+
+    def _plot_manual_impedance_points(self):
+        if self.manual_impedance_model is None:
+            return
+        if not _MATPLOTLIB_OK:
+            QMessageBox.warning(
+                self, "Missing Library",
+                "matplotlib is required.\nInstall with:  pip install matplotlib"
+            )
+            return
+
+        plotted_points = []
+        for point_id, r_value, x_value in self.manual_impedance_model.iter_points():
+            gamma = impedance_to_reflection_value(r_value, x_value)
+            if gamma is None:
+                continue
+            plotted_points.append({
+                "id": point_id,
+                "r": r_value,
+                "x": x_value,
+                "gamma": gamma,
+            })
+
+        self.smith_manual_points = plotted_points
+        if not plotted_points:
+            self.manual_impedance_status_label.setText("No valid R/X values were found to plot.")
+            self._draw_smith_chart(self.df_smith_points or [], self.current_smith_parameter)
+            return
+
+        labels = [f"#{point['id']} ZL={format_impedance_text(complex(point['r'], point['x']))}" for point in plotted_points]
+        self.manual_impedance_status_label.setText(f"Plotted {len(plotted_points)} impedance point(s) on the Smith chart.")
+        self._draw_smith_chart(self.df_smith_points or [], self.current_smith_parameter)
+
+    def _search_load_impedance(self):
+        if self.df_all is None or self.df_all.empty:
+            QMessageBox.warning(self, "No Data", "Please convert data before searching.")
+            return
+
+        try:
+            c1_pct = float(self.zl_search_c1_edit.text().strip())
+            c2_pct = float(self.zl_search_c2_edit.text().strip())
+        except ValueError:
+            QMessageBox.warning(self, "Input Error", "Please enter numeric C1% and C2% values.")
+            return
+
+        if c1_pct < 0 or c1_pct > 100 or c2_pct < 0 or c2_pct > 100:
+            QMessageBox.warning(self, "Input Error", "Please enter C1% and C2% between 0 and 100.")
+            return
+
+        try:
+            result = find_nearest_load_impedance(
+                self.df_all,
+                c1_pct,
+                c2_pct,
+                "S22",
+                conjugate=self.smith_conjugate_button.isChecked(),
+            )
+        except ValueError as exc:
+            QMessageBox.critical(self, "Search Failed", str(exc))
+            return
+
+        self.smith_search_result = result
+        impedance_text = format_impedance_text(result["impedance"])
+        match_text = "exact" if result["exact_match"] else f"nearest (distance {result['distance']:.3g})"
+        conjugate_text = "conjugate on" if self.smith_conjugate_button.isChecked() else "conjugate off"
+        self.zl_search_result_label.setText(
+            f"Requested C1 {result['requested_c1_pct']:.2f}%, C2 {result['requested_c2_pct']:.2f}% -> "
+            f"{match_text}: C1 {result['x_c1_pct']:.2f}%, C2 {result['y_c2_pct']:.2f}% | ZL = {impedance_text} ohms | {conjugate_text}"
+        )
+
+        if _MATPLOTLIB_OK:
+            self._draw_smith_chart(self.df_smith_points or [], self.current_smith_parameter)
 
     def _on_dz_threshold_changed(self):
         if self.current_smith_mode == "dz" and self.df_all is not None and not self.df_all.empty:
@@ -2811,6 +3264,50 @@ class MatchResolutionGui(QMainWindow):
             self.smith_plot_points = []
             self.smith_scatter = None
 
+        manual_points = self.smith_manual_points or []
+        if manual_points:
+            manual_values = np.array([point["gamma"] for point in manual_points], dtype=complex)
+            ax.scatter(
+                manual_values.real,
+                manual_values.imag,
+                marker="*",
+                s=120,
+                c="#D32F2F",
+                edgecolors="white",
+                linewidths=0.8,
+                zorder=5,
+            )
+            for point, gamma_value in zip(manual_points, manual_values):
+                ax.annotate(
+                   f"#{point['id']}",
+                   (gamma_value.real, gamma_value.imag),
+                   textcoords="offset points",
+                   xytext=(5, 5),
+                   fontsize=8,
+                   color="#B71C1C",
+                )
+
+        if self.smith_search_result is not None:
+            search_gamma = self.smith_search_result["gamma"]
+            ax.scatter(
+                [search_gamma.real],
+                [search_gamma.imag],
+                marker="D",
+                s=80,
+                c="#000000",
+                edgecolors="white",
+                linewidths=0.8,
+                zorder=6,
+            )
+            ax.annotate(
+                "ZL",
+                (search_gamma.real, search_gamma.imag),
+                textcoords="offset points",
+                xytext=(5, -10),
+                fontsize=8,
+                color="#000000",
+            )
+
         mode_label = {
             "xy": "X-Y Table",
             "dz": "dZ",
@@ -2821,6 +3318,7 @@ class MatchResolutionGui(QMainWindow):
         self.smith_canvas.draw()
 
     def toggle_smith_conjugate(self, checked):
+        self.smith_conjugate_enabled = checked
         self.smith_conjugate_button.setText("Conjugate On" if checked else "Conjugate")
         if self.df_smith_points is not None:
             self._draw_smith_chart(self.df_smith_points, self.current_smith_parameter)
@@ -2994,6 +3492,8 @@ class MatchResolutionGui(QMainWindow):
             self.refresh_dz_table()
             self.refresh_reflection_table()
             self.refresh_efficiency_table()
+            self.smith_search_result = None
+            self.zl_search_result_label.setText("ZL search result will appear here.")
             self.refresh_smith_chart()
 
             total_rows = len(self.df_all)
@@ -3030,7 +3530,7 @@ class MatchResolutionGui(QMainWindow):
             f"Impedance tab uses {self.current_impedance_parameter}.\n"
             f"dZ tab uses {self.current_dz_parameter}.\n"
             f"Reflect Coefficient tab uses {self.current_reflection_parameter} {self.current_reflection_mode}.\n"
-            f"Efficiency tab uses S11 and S21.\n"
+            f"Efficiency tab uses {self.efficiency_mode_combo.currentText()}.\n"
             f"Smith Chart uses {self.current_smith_parameter}."
             )
 
@@ -3057,7 +3557,8 @@ class MatchResolutionGui(QMainWindow):
                 + f"_{self.current_reflection_parameter.lower()}_{self.current_reflection_mode}_reflect_coefficient_table.csv"
             )
         elif current_tab == "Efficiency" and self.df_efficiency_display is not None:
-            default_name = base_name + "_efficiency_table.csv"
+            efficiency_suffix = self.current_efficiency_mode
+            default_name = base_name + f"_{efficiency_suffix}_efficiency_table.csv"
         else:
             default_name = base_name + f"_{self.current_xy_parameter.lower()}_xy_table.csv"
 
