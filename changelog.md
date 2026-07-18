@@ -4,6 +4,11 @@
 
 - Switched application version to load from the root `VERSION` file so releases only require changing one version source.
 - Fixed one-file executable startup by bundling `VERSION` in PyInstaller builds and adding frozen-app version path fallback.
+- Added cable de-embedding workflow (S→T, cable inverse T, de-embed, T→S) applied during conversion so Display/plots use de-embedded S-parameters.
+- Added optional cable file input path in the UI with default no-cable fallback values when no cable file is provided.
+- Updated Smith search panel layout: `Search ZL` moved under `C1%` and `Carry Over` moved under `C2%`, with wider controls for full label visibility.
+- Moved Smith hover hint text directly under `Parameter:` in the Smith toolbar.
+- App window now launches maximized on startup.
 
 ## V1.0.5
 
