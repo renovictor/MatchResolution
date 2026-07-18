@@ -5,7 +5,7 @@ import sys
 import numpy as np
 import pandas as pd
 
-from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex
+from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QEventLoop, QElapsedTimer, QTimer
 from PySide6.QtGui import QColor, QBrush, QFont, QDoubleValidator
 from PySide6.QtWidgets import (
     QApplication,
@@ -20,6 +20,8 @@ from PySide6.QtWidgets import (
     QLabel,
     QPushButton,
     QLineEdit,
+    QSpinBox,
+    QProgressBar,
     QTableView,
     QMessageBox,
     QFrame,
@@ -77,6 +79,106 @@ DEFAULT_CABLE_S_PARAMETERS = {
         "s22": 0.000001 + 0.000001j,
     },
 }
+
+
+def app_base_path():
+    if hasattr(sys, "_MEIPASS"):
+        return getattr(sys, "_MEIPASS")
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+class StartupSplash(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(Qt.SplashScreen | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setFixedSize(860, 520)
+        self.setStyleSheet("background-color: #F3E5F5; border: 1px solid #9575CD;")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 22, 22, 18)
+        layout.setSpacing(12)
+
+        header = QFrame()
+        header.setStyleSheet("""
+            QFrame {
+                background-color: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #6A1B9A,
+                    stop:0.55 #8E24AA,
+                    stop:1 #3949AB
+                );
+                border-radius: 18px;
+            }
+        """)
+        header_layout = QVBoxLayout(header)
+        header_layout.setContentsMargins(22, 18, 22, 18)
+        header_layout.setSpacing(4)
+
+        title_label = QLabel("MatchResolution")
+        title_label.setStyleSheet("font-size: 32px; font-weight: bold; color: white;")
+        subtitle_label = QLabel("RF Matching Resolution Tool")
+        subtitle_label.setStyleSheet("font-size: 16px; color: #EDE7F6;")
+        version_label = QLabel(f"Version {APP_VERSION}")
+        version_label.setStyleSheet("font-size: 15px; color: #E1BEE7; font-weight: bold;")
+        header_layout.addWidget(title_label)
+        header_layout.addWidget(subtitle_label)
+        header_layout.addWidget(version_label)
+        layout.addWidget(header)
+
+        body = QFrame()
+        body.setStyleSheet("""
+            QFrame {
+                background-color: white;
+                border: 1px solid #D1C4E9;
+                border-radius: 16px;
+            }
+        """)
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(18, 18, 18, 18)
+        body_layout.setSpacing(10)
+
+        self.status_label = QLabel("Starting application...")
+        self.status_label.setStyleSheet("font-size: 14px; color: #4527A0; padding: 4px 2px;")
+        body_layout.addWidget(self.status_label)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setFormat("%p%")
+        self.progress_bar.setFixedHeight(24)
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                background-color: #EDE7F6;
+                border: 1px solid #9575CD;
+                border-radius: 10px;
+                text-align: center;
+                color: #4527A0;
+                font-weight: bold;
+            }
+            QProgressBar::chunk {
+                background-color: #7E57C2;
+                border-radius: 10px;
+            }
+        """)
+        body_layout.addWidget(self.progress_bar)
+
+        self.detail_label = QLabel("Loading modules and preparing the main window...")
+        self.detail_label.setStyleSheet("font-size: 12px; color: #6A1B9A;")
+        body_layout.addWidget(self.detail_label)
+
+        layout.addWidget(body, stretch=1)
+
+        self.footer_label = QLabel("© ASM · V. Huang · victor.huang@asm.com")
+        self.footer_label.setAlignment(Qt.AlignCenter)
+        self.footer_label.setStyleSheet("font-size: 12px; color: #6A1B9A; padding-top: 4px;")
+        layout.addWidget(self.footer_label)
+
+    def set_status(self, message, progress=None):
+        self.status_label.setText(message)
+        self.detail_label.setText("Please wait while the application initializes.")
+        if progress is not None:
+            self.progress_bar.setValue(max(0, min(100, int(progress))))
 
 
 def _read_app_version() -> str:
@@ -295,6 +397,19 @@ def format_complex_text(real_value, imag_value):
 
     sign = "+" if imag_value >= 0 else "-"
     return f"{real_value:.3g}{sign}{abs(imag_value):.3g}i"
+
+
+def format_phase_magnitude_text(complex_value, rotation_degrees=0):
+    if complex_value is None:
+        return ""
+
+    rotated_value = complex_value * np.exp(1j * np.deg2rad(rotation_degrees))
+    magnitude = abs(rotated_value)
+    if magnitude < 1e-12:
+        phase_degrees = 0.0
+    else:
+        phase_degrees = (np.degrees(np.angle(rotated_value)) + 360.0) % 360.0
+    return f"{magnitude:.4g} ∠ {phase_degrees:.1f}°"
 
 
 def parse_full_row(tokens):
@@ -556,6 +671,101 @@ def build_xy_display_table(df, parameter_name):
     presentation_rows = []
     presentation_rows.append(["", "", "c1 coarse"] + [str(x // 64) for x in x_values])
     presentation_rows.append(["", parameter_name, "c1 fine"] + [str(x % 64) for x in x_values])
+    presentation_rows.append(["C2 coarse", "c2 fine", "percentage"] + [f"{(x / x_denominator) * 100:.2f}%" for x in x_values])
+
+    for y_index, y_value in enumerate(y_values):
+        presentation_rows.append(
+            [
+                str(y_value // 64),
+                str(y_value % 64),
+                f"{(y_value / y_denominator) * 100:.2f}%",
+                *grid[y_index],
+            ]
+        )
+
+    return pd.DataFrame(presentation_rows)
+
+
+def build_phase_magnitude_display_table(df, parameter_name, rotation_degrees=0):
+    """
+    Build a spreadsheet-like table that shows magnitude and phase in degrees.
+    """
+    real_col = f"{parameter_name}_r"
+    imag_col = f"{parameter_name}_x"
+
+    if real_col not in df.columns or imag_col not in df.columns:
+        raise ValueError(f"Missing columns for {parameter_name}.")
+
+    x_values, y_values = extract_xy_axis_values(df)
+    x_lookup = {value: index for index, value in enumerate(x_values)}
+    y_lookup = {value: index for index, value in enumerate(y_values)}
+    x_denominator = max(x_values) if max(x_values) > 0 else 1
+    y_denominator = max(y_values) if max(y_values) > 0 else 1
+
+    grid = [["" for _ in x_values] for _ in y_values]
+
+    for row in df[["X_C1", "Y_C2", real_col, imag_col]].itertuples(index=False):
+        x_pos = int(row[0])
+        y_pos = int(row[1])
+        real_value = row[2]
+        imag_value = row[3]
+        if pd.isna(real_value) or pd.isna(imag_value):
+            continue
+        grid[y_lookup[y_pos]][x_lookup[x_pos]] = format_phase_magnitude_text(
+            complex(real_value, imag_value),
+            rotation_degrees=rotation_degrees,
+        )
+
+    presentation_rows = []
+    presentation_rows.append(["", "", "c1 coarse"] + [str(x // 64) for x in x_values])
+    presentation_rows.append(["", f"Phase({parameter_name})", "c1 fine"] + [str(x % 64) for x in x_values])
+    presentation_rows.append(["C2 coarse", "c2 fine", "percentage"] + [f"{(x / x_denominator) * 100:.2f}%" for x in x_values])
+
+    for y_index, y_value in enumerate(y_values):
+        presentation_rows.append(
+            [
+                str(y_value // 64),
+                str(y_value % 64),
+                f"{(y_value / y_denominator) * 100:.2f}%",
+                *grid[y_index],
+            ]
+        )
+
+    return pd.DataFrame(presentation_rows)
+
+
+def build_contour_display_table(df, parameter_name):
+    """
+    Build a spreadsheet-like contour table that keeps only the outer edge values.
+    """
+    real_col = f"{parameter_name}_r"
+    imag_col = f"{parameter_name}_x"
+
+    if real_col not in df.columns or imag_col not in df.columns:
+        raise ValueError(f"Missing columns for {parameter_name}.")
+
+    x_values, y_values = extract_xy_axis_values(df)
+    x_lookup = {value: index for index, value in enumerate(x_values)}
+    y_lookup = {value: index for index, value in enumerate(y_values)}
+    x_min = x_values[0]
+    x_max = x_values[-1]
+    y_min = y_values[0]
+    y_max = y_values[-1]
+    x_denominator = max(x_values) if max(x_values) > 0 else 1
+    y_denominator = max(y_values) if max(y_values) > 0 else 1
+
+    grid = [["" for _ in x_values] for _ in y_values]
+
+    for row in df[["X_C1", "Y_C2", real_col, imag_col]].itertuples(index=False):
+        x_pos = int(row[0])
+        y_pos = int(row[1])
+        if x_pos not in (x_min, x_max) and y_pos not in (y_min, y_max):
+            continue
+        grid[y_lookup[y_pos]][x_lookup[x_pos]] = format_complex_text(row[2], row[3])
+
+    presentation_rows = []
+    presentation_rows.append(["", "", "c1 coarse"] + [str(x // 64) for x in x_values])
+    presentation_rows.append(["", f"Contour({parameter_name})", "c1 fine"] + [str(x % 64) for x in x_values])
     presentation_rows.append(["C2 coarse", "c2 fine", "percentage"] + [f"{(x / x_denominator) * 100:.2f}%" for x in x_values])
 
     for y_index, y_value in enumerate(y_values):
@@ -1000,6 +1210,50 @@ def build_smith_chart_plot_data(df, parameter_name):
     return points
 
 
+def build_smith_contour_plot_data(df, parameter_name):
+    real_col = f"{parameter_name}_r"
+    imag_col = f"{parameter_name}_x"
+
+    if real_col not in df.columns or imag_col not in df.columns:
+        raise ValueError(f"Missing columns for {parameter_name}.")
+
+    x_values, y_values = extract_xy_axis_values(df)
+    point_lookup = {}
+    for row in df[["X_C1", "Y_C2", real_col, imag_col]].itertuples(index=False):
+        real_value = row[2]
+        imag_value = row[3]
+        if pd.isna(real_value) or pd.isna(imag_value):
+            continue
+        key = (int(row[0]), int(row[1]))
+        point_lookup[key] = {
+            "x_c1": key[0],
+            "y_c2": key[1],
+            "gamma": complex(real_value, imag_value),
+            "impedance": reflect_to_impedance_value(real_value, imag_value) if parameter_name in IMPEDANCE_PARAMETERS else None,
+        }
+
+    x_min = x_values[0]
+    x_max = x_values[-1]
+    y_min = y_values[0]
+    y_max = y_values[-1]
+    ordered_keys = []
+    ordered_keys.extend((x_min, y_value) for y_value in y_values)
+    ordered_keys.extend((x_value, y_max) for x_value in x_values[1:])
+    ordered_keys.extend((x_max, y_value) for y_value in reversed(y_values[:-1]))
+    ordered_keys.extend((x_value, y_min) for x_value in reversed(x_values[:-1]))
+
+    points = []
+    for key in ordered_keys:
+        point = point_lookup.get(key)
+        if point is not None:
+            points.append(point)
+
+    if points:
+        points.append(points[0])
+
+    return points
+
+
 def build_smith_dz_lookup(df, z0=DEFAULT_Z0):
     """
     Build a lookup table for Smith-chart dZ coloring.
@@ -1425,8 +1679,9 @@ class ManualImpedanceTableModel(QAbstractTableModel):
 
 
 class MatchResolutionGui(QMainWindow):
-    def __init__(self):
+    def __init__(self, startup_status_callback=None):
         super().__init__()
+        self.startup_status_callback = startup_status_callback
 
         self.setWindowTitle(f"RF Matching Resolution Tool {APP_VERSION} - Step 1: CMD to X-Y Table")
         self.resize(1400, 850)
@@ -1436,6 +1691,11 @@ class MatchResolutionGui(QMainWindow):
         self.df_display = None
         self.df_xy_display = None
         self.current_xy_parameter = "S22"
+        self.df_phase_display = None
+        self.current_phase_parameter = "S22"
+        self.phase_rotation_degrees = 0
+        self.df_contour_display = None
+        self.current_contour_parameter = "S22"
         self.df_impedance_display = None
         self.current_impedance_parameter = "S22"
         self.df_dz_display = None
@@ -1464,7 +1724,12 @@ class MatchResolutionGui(QMainWindow):
 
         self.init_ui()
 
+    def _startup_status(self, message, progress=None):
+        if self.startup_status_callback is not None:
+            self.startup_status_callback(message, progress)
+
     def init_ui(self):
+        self._startup_status("Building main interface...", 10)
         main_widget = QWidget()
         main_layout = QVBoxLayout(main_widget)
 
@@ -1635,6 +1900,7 @@ class MatchResolutionGui(QMainWindow):
         file_layout.addLayout(cable_row)
 
         main_layout.addWidget(file_frame)
+        self._startup_status("Preparing analysis tabs...", 30)
 
         stats_frame = QFrame()
         stats_frame.setStyleSheet("""
@@ -1764,6 +2030,107 @@ class MatchResolutionGui(QMainWindow):
         """)
         self.xy_tab = self.create_table_page(self.xy_table_view, xy_toolbar)
         self.tabs.addTab(self.xy_tab, "X-Y Table")
+
+        phase_toolbar = QFrame()
+        phase_toolbar.setStyleSheet("""
+            QFrame {
+                background-color: #E3F2FD;
+                border-radius: 10px;
+                padding: 8px;
+            }
+        """)
+        phase_toolbar_layout = QHBoxLayout(phase_toolbar)
+
+        phase_toolbar_layout.addWidget(QLabel("Parameter:"))
+        self.phase_parameter_combo = QComboBox()
+        self.phase_parameter_combo.addItems(XY_PARAMETERS)
+        self.phase_parameter_combo.setCurrentText("S22")
+        self.phase_parameter_combo.currentTextChanged.connect(self.refresh_phase_table)
+        phase_toolbar_layout.addWidget(self.phase_parameter_combo)
+        phase_toolbar_layout.addWidget(QLabel("Rotation is controlled on the Smith Chart tab."))
+        self.phase_cell_label = QLabel("Click a cell to see the value here.")
+        self.phase_cell_label.setStyleSheet("""
+            QLabel {
+                color: #0D47A1;
+                background-color: #E8F4FD;
+                border: 1px solid #90CAF9;
+                border-radius: 8px;
+                padding: 6px 10px;
+                font-weight: bold;
+            }
+        """)
+        phase_toolbar_layout.addWidget(self.phase_cell_label, stretch=1)
+        phase_toolbar_layout.addStretch(1)
+
+        self.phase_table_view = QTableView()
+        self.phase_table_view.setAlternatingRowColors(False)
+        self.phase_table_view.setStyleSheet("""
+            QTableView {
+                background-color: white;
+                gridline-color: #90A4AE;
+                font-size: 12px;
+            }
+            QHeaderView::section {
+                background-color: #1565C0;
+                color: white;
+                padding: 4px;
+                border: 1px solid #1E88E5;
+                font-weight: bold;
+            }
+        """)
+        self.phase_tab = self.create_table_page(self.phase_table_view, phase_toolbar)
+        self.tabs.addTab(self.phase_tab, "Phase Magnitude")
+
+        contour_toolbar = QFrame()
+        contour_toolbar.setStyleSheet("""
+            QFrame {
+                background-color: #E8F5E9;
+                border-radius: 10px;
+                padding: 8px;
+            }
+        """)
+        contour_toolbar_layout = QHBoxLayout(contour_toolbar)
+
+        contour_toolbar_layout.addWidget(QLabel("Parameter:"))
+        self.contour_parameter_combo = QComboBox()
+        self.contour_parameter_combo.addItems(XY_PARAMETERS)
+        self.contour_parameter_combo.setCurrentText("S22")
+        self.contour_parameter_combo.currentTextChanged.connect(self.refresh_contour_table)
+        contour_toolbar_layout.addWidget(self.contour_parameter_combo)
+
+        contour_toolbar_layout.addWidget(QLabel("This tab keeps only the contour edge data."))
+        self.contour_cell_label = QLabel("Click a cell to see the value here.")
+        self.contour_cell_label.setStyleSheet("""
+            QLabel {
+                color: #1B5E20;
+                background-color: #E8F5E9;
+                border: 1px solid #A5D6A7;
+                border-radius: 8px;
+                padding: 6px 10px;
+                font-weight: bold;
+            }
+        """)
+        contour_toolbar_layout.addWidget(self.contour_cell_label, stretch=1)
+        contour_toolbar_layout.addStretch(1)
+
+        self.contour_table_view = QTableView()
+        self.contour_table_view.setAlternatingRowColors(False)
+        self.contour_table_view.setStyleSheet("""
+            QTableView {
+                background-color: white;
+                gridline-color: #90A4AE;
+                font-size: 12px;
+            }
+            QHeaderView::section {
+                background-color: #2E7D32;
+                color: white;
+                padding: 4px;
+                border: 1px solid #43A047;
+                font-weight: bold;
+            }
+        """)
+        self.contour_tab = self.create_table_page(self.contour_table_view, contour_toolbar)
+        self.tabs.addTab(self.contour_tab, "Contour")
 
         impedance_toolbar = QFrame()
         impedance_toolbar.setStyleSheet("""
@@ -1965,10 +2332,28 @@ class MatchResolutionGui(QMainWindow):
         parameter_layout.addLayout(parameter_row)
         parameter_layout.addWidget(self.smith_hover_label)
         smith_toolbar_layout.addLayout(parameter_layout)
+        button_stack = QVBoxLayout()
         self.smith_conjugate_button = QPushButton("Conjugate")
         self.smith_conjugate_button.setCheckable(True)
         self.smith_conjugate_button.toggled.connect(self.toggle_smith_conjugate)
-        smith_toolbar_layout.addWidget(self.smith_conjugate_button)
+        button_stack.addWidget(self.smith_conjugate_button)
+        self.smith_save_image_button = QPushButton("Save Image")
+        self.smith_save_image_button.setMinimumWidth(90)
+        self.smith_save_image_button.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-weight: bold; }")
+        self.smith_save_image_button.clicked.connect(self._save_smith_chart_image)
+        button_stack.addWidget(self.smith_save_image_button)
+        rotation_row = QHBoxLayout()
+        rotation_row.addWidget(QLabel("Rotation:"))
+        self.phase_rotation_spin = QSpinBox()
+        self.phase_rotation_spin.setRange(0, 360)
+        self.phase_rotation_spin.setSuffix("°")
+        self.phase_rotation_spin.setValue(0)
+        self.phase_rotation_spin.valueChanged.connect(self._on_phase_rotation_changed)
+        rotation_row.addWidget(self.phase_rotation_spin)
+        rotation_row.addStretch(1)
+        button_stack.addLayout(rotation_row)
+        button_stack.addStretch(1)
+        smith_toolbar_layout.addLayout(button_stack)
         smith_toolbar_layout.addWidget(QLabel("Plot X-Y table values on a Smith chart."))
         self.smith_status_label = QLabel("Select data and press Convert.")
         self.smith_status_label.setStyleSheet("""
@@ -1999,12 +2384,16 @@ class MatchResolutionGui(QMainWindow):
         self.smith_mode_dz_radio = QRadioButton("dZ")
         self.smith_mode_dgamma_radio = QRadioButton("dΓ")
         self.smith_mode_efficiency_radio = QRadioButton("Efficiency")
+        self.smith_mode_contour_radio = QRadioButton("Contour")
+        self.smith_mode_pm_radio = QRadioButton("P/M")
 
         for mode, radio_button in (
             ("xy", self.smith_mode_xy_radio),
             ("dz", self.smith_mode_dz_radio),
             ("dgamma", self.smith_mode_dgamma_radio),
             ("efficiency", self.smith_mode_efficiency_radio),
+            ("contour", self.smith_mode_contour_radio),
+            ("pm", self.smith_mode_pm_radio),
         ):
             radio_button.setStyleSheet("QRadioButton { color: #D32F2F; font-size: 14px; }")
             self.smith_mode_group.addButton(radio_button)
@@ -2410,6 +2799,7 @@ class MatchResolutionGui(QMainWindow):
         self.tabs.addTab(self.component_tab, "Component")
         self.tabs.addTab(self.reflection_tab, "Reflect Coefficient")
         self.tabs.addTab(self.efficiency_tab, "Efficiency")
+        self._startup_status("Preparing Smith chart and plots...", 75)
 
         main_layout.addWidget(self.tabs, stretch=1)
 
@@ -2421,6 +2811,7 @@ class MatchResolutionGui(QMainWindow):
         main_layout.addWidget(note)
 
         self.setCentralWidget(main_widget)
+        self._startup_status("Finalizing window...", 95)
 
     def build_tab_page(self, title_text, body_text):
         page = QWidget()
@@ -2812,6 +3203,92 @@ class MatchResolutionGui(QMainWindow):
         else:
             self.xy_cell_label.setText(f"Row {row + 1}, Col {column + 1}: {value}")
 
+    def refresh_phase_table(self):
+        if self.df_all is None or self.df_all.empty:
+            return
+
+        self.current_phase_parameter = self.phase_parameter_combo.currentText().strip()
+        self.phase_rotation_degrees = int(self.phase_rotation_spin.value())
+        self.df_phase_display = build_phase_magnitude_display_table(
+            self.df_all,
+            self.current_phase_parameter,
+            rotation_degrees=self.phase_rotation_degrees,
+        )
+
+        self.phase_table_model = PandasTableModel(self.df_phase_display)
+        self.phase_table_view.setModel(self.phase_table_model)
+        self.phase_table_view.horizontalHeader().setVisible(False)
+        self.phase_table_view.verticalHeader().setVisible(False)
+        self.phase_table_view.horizontalHeader().setSectionResizeMode(QHeaderView.Fixed)
+        self.phase_table_view.horizontalHeader().setDefaultSectionSize(88)
+        self.phase_table_view.verticalHeader().setDefaultSectionSize(24)
+        self.phase_table_view.setSelectionBehavior(QTableView.SelectItems)
+        self.phase_table_view.setSelectionMode(QTableView.SingleSelection)
+        selection_model = self.phase_table_view.selectionModel()
+        if selection_model is not None:
+            selection_model.currentChanged.connect(self.update_phase_cell_label)
+        self.phase_cell_label.setText("Click a cell to see the value here.")
+
+    def update_phase_cell_label(self, current, previous):
+        if not current.isValid() or self.df_phase_display is None:
+            self.phase_cell_label.setText("Click a cell to see the value here.")
+            return
+
+        row = current.row()
+        column = current.column()
+        if row >= len(self.df_phase_display.index) or column >= len(self.df_phase_display.columns):
+            self.phase_cell_label.setText("Click a cell to see the value here.")
+            return
+
+        value = self.df_phase_display.iat[row, column]
+        if value == "":
+            self.phase_cell_label.setText(f"Row {row + 1}, Col {column + 1}: empty")
+        else:
+            self.phase_cell_label.setText(f"Row {row + 1}, Col {column + 1}: {value}")
+
+    def _on_phase_rotation_changed(self, value):
+        self.refresh_phase_table()
+        if self.df_all is not None and not self.df_all.empty and self.current_smith_mode == "pm":
+            self.refresh_smith_chart()
+
+    def refresh_contour_table(self):
+        if self.df_all is None or self.df_all.empty:
+            return
+
+        self.current_contour_parameter = self.contour_parameter_combo.currentText().strip()
+        self.df_contour_display = build_contour_display_table(self.df_all, self.current_contour_parameter)
+
+        self.contour_table_model = PandasTableModel(self.df_contour_display)
+        self.contour_table_view.setModel(self.contour_table_model)
+        self.contour_table_view.horizontalHeader().setVisible(False)
+        self.contour_table_view.verticalHeader().setVisible(False)
+        self.contour_table_view.horizontalHeader().setSectionResizeMode(QHeaderView.Fixed)
+        self.contour_table_view.horizontalHeader().setDefaultSectionSize(72)
+        self.contour_table_view.verticalHeader().setDefaultSectionSize(24)
+        self.contour_table_view.setSelectionBehavior(QTableView.SelectItems)
+        self.contour_table_view.setSelectionMode(QTableView.SingleSelection)
+        selection_model = self.contour_table_view.selectionModel()
+        if selection_model is not None:
+            selection_model.currentChanged.connect(self.update_contour_cell_label)
+        self.contour_cell_label.setText("Click a cell to see the value here.")
+
+    def update_contour_cell_label(self, current, previous):
+        if not current.isValid() or self.df_contour_display is None:
+            self.contour_cell_label.setText("Click a cell to see the value here.")
+            return
+
+        row = current.row()
+        column = current.column()
+        if row >= len(self.df_contour_display.index) or column >= len(self.df_contour_display.columns):
+            self.contour_cell_label.setText("Click a cell to see the value here.")
+            return
+
+        value = self.df_contour_display.iat[row, column]
+        if value == "":
+            self.contour_cell_label.setText(f"Row {row + 1}, Col {column + 1}: empty")
+        else:
+            self.contour_cell_label.setText(f"Row {row + 1}, Col {column + 1}: {value}")
+
     def refresh_dz_table(self):
         if self.df_all is None or self.df_all.empty:
             return
@@ -3116,22 +3593,37 @@ class MatchResolutionGui(QMainWindow):
             return
 
         self.current_smith_parameter = self.smith_parameter_combo.currentText().strip()
-        self.df_smith_points = build_smith_chart_plot_data(self.df_all, self.current_smith_parameter)
-        if {"S22_r", "S22_x"}.issubset(set(self.df_all.columns)):
-            self.smith_dz_lookup = build_smith_dz_lookup(self.df_all)
-        else:
+        if self.current_smith_mode == "contour":
+            self.df_smith_points = build_smith_contour_plot_data(self.df_all, self.current_smith_parameter)
             self.smith_dz_lookup = {}
-        if {f"{self.current_smith_parameter}_r", f"{self.current_smith_parameter}_x"}.issubset(set(self.df_all.columns)):
-            self.smith_dgamma_lookup = build_smith_dgamma_lookup(
-                self.df_all,
-                self.current_smith_parameter,
-                self.current_reflection_mode,
-            )
-        else:
             self.smith_dgamma_lookup = {}
-        self.smith_efficiency_lookup = build_smith_efficiency_lookup(self.df_all)
+            self.smith_efficiency_lookup = {}
+        else:
+            self.df_smith_points = build_smith_chart_plot_data(self.df_all, self.current_smith_parameter)
+            if {"S22_r", "S22_x"}.issubset(set(self.df_all.columns)):
+                self.smith_dz_lookup = build_smith_dz_lookup(self.df_all)
+            else:
+                self.smith_dz_lookup = {}
+            if {f"{self.current_smith_parameter}_r", f"{self.current_smith_parameter}_x"}.issubset(set(self.df_all.columns)):
+                self.smith_dgamma_lookup = build_smith_dgamma_lookup(
+                    self.df_all,
+                    self.current_smith_parameter,
+                    self.current_reflection_mode,
+                )
+            else:
+                self.smith_dgamma_lookup = {}
+            self.smith_efficiency_lookup = build_smith_efficiency_lookup(self.df_all)
 
-        if self.current_smith_mode == "dz":
+        if self.current_smith_mode == "contour":
+            contour_count = max(len(self.df_smith_points) - 1, 0)
+            self.smith_status_label.setText(
+                f"{self.current_smith_parameter}: contour edge with {contour_count:,} points"
+            )
+        elif self.current_smith_mode == "pm":
+            self.smith_status_label.setText(
+                f"{self.current_smith_parameter}: phase/magnitude points | rotation {self.phase_rotation_spin.value()}°"
+            )
+        elif self.current_smith_mode == "dz":
             thresholds = self._get_dz_thresholds(show_message=False)
             if thresholds is None:
                 good_threshold, poor_threshold = 0.001, 1.0
@@ -3457,6 +3949,42 @@ class MatchResolutionGui(QMainWindow):
                        edgecolors="none",
                        picker=True,
                    )
+            elif self.current_smith_mode == "pm":
+                rotation_radians = np.deg2rad(self.phase_rotation_spin.value())
+                rotated_values = values * np.exp(1j * rotation_radians)
+                self.smith_plot_values = rotated_values
+                phase_angles = (np.degrees(np.angle(rotated_values)) + 360.0) % 360.0
+                point_sizes = 18 + (32 * np.clip(np.abs(rotated_values), 0.0, 1.0))
+                self.smith_scatter = ax.scatter(
+                   rotated_values.real,
+                   rotated_values.imag,
+                   c=phase_angles,
+                   cmap="twilight",
+                   s=point_sizes,
+                   alpha=0.9,
+                   edgecolors="none",
+                   picker=True,
+                )
+                colorbar = self.smith_figure.colorbar(self.smith_scatter, ax=ax, pad=0.02, shrink=0.85)
+                colorbar.set_label("Phase (degrees)", fontsize=9)
+            elif self.current_smith_mode == "contour":
+               self.smith_scatter = ax.scatter(
+                   values.real,
+                   values.imag,
+                   c="#F57C00",
+                   s=18,
+                   alpha=0.9,
+                   edgecolors="none",
+                   picker=True,
+               )
+               ax.plot(
+                   values.real,
+                   values.imag,
+                   color="#F57C00",
+                   linewidth=1.4,
+                   alpha=0.9,
+                   zorder=4,
+               )
             else:
                colors = np.arange(len(values))
                self.smith_scatter = ax.scatter(
@@ -3523,6 +4051,8 @@ class MatchResolutionGui(QMainWindow):
             "dz": "dZ",
             "dgamma": f"dΓ ({self.current_reflection_mode})",
             "dvswr": "dVSWR (Under construction)",
+            "contour": "Contour",
+            "pm": "P/M",
         }.get(self.current_smith_mode, "X-Y Table")
         ax.set_title(f"Smith Chart - {parameter_name} [{mode_label}]", fontsize=11, fontweight="bold")
         self.smith_canvas.draw()
@@ -3532,6 +4062,39 @@ class MatchResolutionGui(QMainWindow):
         self.smith_conjugate_button.setText("Conjugate On" if checked else "Conjugate")
         if self.df_smith_points is not None:
             self._draw_smith_chart(self.df_smith_points, self.current_smith_parameter)
+
+    def _save_smith_chart_image(self):
+        if not _MATPLOTLIB_OK or not hasattr(self, "smith_figure"):
+            QMessageBox.warning(
+                self,
+                "Missing Library",
+                "matplotlib is required.\nInstall with:  pip install matplotlib"
+            )
+            return
+
+        input_path = self.file_path_edit.text().strip()
+        base_name = os.path.splitext(os.path.basename(input_path))[0] if input_path else "smith_chart"
+        parameter_name = self.smith_parameter_combo.currentText().strip() or "smith"
+        default_name = f"{base_name}_{parameter_name.lower()}_smith_chart.png"
+
+        save_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Smith Chart Image",
+            default_name,
+            "PNG Files (*.png);;All Files (*)"
+        )
+
+        if not save_path:
+            return
+
+        if not os.path.splitext(save_path)[1]:
+            save_path += ".png"
+
+        try:
+            self.smith_figure.savefig(save_path, dpi=300, bbox_inches="tight")
+            QMessageBox.information(self, "Save Finished", f"Smith chart image saved successfully:\n{save_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Save Failed", str(e))
 
     def _format_smith_impedance_text(self, gamma_value):
         z_value = reflect_to_impedance_value(gamma_value.real, gamma_value.imag)
@@ -3554,7 +4117,12 @@ class MatchResolutionGui(QMainWindow):
         else:
             impedance_text = "Z=not available for this parameter"
 
-        return f"C1 {c1_text} | C2 {c2_text} | {gamma_text} | {impedance_text}"
+        if self.current_smith_mode == "pm":
+            pm_text = f" | |Γ|={abs(gamma_value):.6g} | ∠={((np.degrees(np.angle(gamma_value)) + 360.0) % 360.0):.1f}°"
+        else:
+            pm_text = ""
+
+        return f"C1 {c1_text} | C2 {c2_text} | {gamma_text}{pm_text} | {impedance_text}"
 
     def _on_smith_hover(self, event):
         if not _MATPLOTLIB_OK or self.smith_scatter is None or event.inaxes is None:
@@ -3716,6 +4284,8 @@ class MatchResolutionGui(QMainWindow):
             self.df_display = self.df_all.head(5000).copy()
             self.refresh_display_table()
             self.refresh_xy_table()
+            self.refresh_phase_table()
+            self.refresh_contour_table()
             self.refresh_impedance_table()
             self.refresh_dz_table()
             self.refresh_reflection_table()
@@ -3756,10 +4326,12 @@ class MatchResolutionGui(QMainWindow):
                 f"Successfully converted {total_rows:,} rows.\n\n"
                 f"Cable de-embed source: {self.current_cable_source}\n"
                 f"X-Y tab uses {self.current_xy_parameter}.\n"
+                f"Phase tab uses {self.current_phase_parameter} at {self.phase_rotation_degrees}°.\n"
                 f"Impedance tab uses {self.current_impedance_parameter}.\n"
                 f"dZ tab uses {self.current_dz_parameter}.\n"
                 f"Reflect Coefficient tab uses {self.current_reflection_parameter} {self.current_reflection_mode}.\n"
                 f"Efficiency tab uses {self.efficiency_mode_combo.currentText()}.\n"
+                f"Contour tab uses {self.current_contour_parameter}.\n"
                 f"Smith Chart uses {self.current_smith_parameter}."
             )
 
@@ -3788,6 +4360,10 @@ class MatchResolutionGui(QMainWindow):
         elif current_tab == "Efficiency" and self.df_efficiency_display is not None:
             efficiency_suffix = self.current_efficiency_mode
             default_name = base_name + f"_{efficiency_suffix}_efficiency_table.csv"
+        elif current_tab == "Phase Magnitude" and self.df_phase_display is not None:
+            default_name = base_name + f"_{self.current_phase_parameter.lower()}_{self.phase_rotation_degrees}deg_phase_table.csv"
+        elif current_tab == "Contour" and self.df_contour_display is not None:
+            default_name = base_name + f"_{self.current_contour_parameter.lower()}_contour_table.csv"
         else:
             default_name = base_name + f"_{self.current_xy_parameter.lower()}_xy_table.csv"
 
@@ -3810,6 +4386,10 @@ class MatchResolutionGui(QMainWindow):
                 self.df_reflection_display.to_csv(save_path, index=False, header=False)
             elif current_tab == "Efficiency" and self.df_efficiency_display is not None:
                 self.df_efficiency_display.to_csv(save_path, index=False, header=False)
+            elif current_tab == "Phase Magnitude" and self.df_phase_display is not None:
+                self.df_phase_display.to_csv(save_path, index=False, header=False)
+            elif current_tab == "Contour" and self.df_contour_display is not None:
+                self.df_contour_display.to_csv(save_path, index=False, header=False)
             elif self.df_xy_display is not None:
                 self.df_xy_display.to_csv(save_path, index=False, header=False)
             else:
@@ -3835,7 +4415,27 @@ if __name__ == "__main__":
         }
     """)
 
-    window = MatchResolutionGui()
+    def startup_status(message, progress=None):
+        startup_splash.set_status(message, progress)
+        app.processEvents()
+
+    startup_splash = StartupSplash()
+    startup_splash.show()
+    app.processEvents()
+
+    startup_timer = QElapsedTimer()
+    startup_timer.start()
+    startup_status("Loading application...", 5)
+    window = MatchResolutionGui(startup_status_callback=startup_status)
+
+    remaining_ms = 10000 - int(startup_timer.elapsed())
+    if remaining_ms > 0:
+        wait_loop = QEventLoop()
+        QTimer.singleShot(remaining_ms, wait_loop.quit)
+        wait_loop.exec()
+
+    startup_status("Opening main window...", 100)
+    startup_splash.close()
     window.show()
 
     sys.exit(app.exec())
