@@ -62,6 +62,21 @@ REDUCED_GRID_ROWS = 7 * 8 * 7 * 8
 XY_PARAMETERS = ["S11", "S21", "S12", "S22"]
 IMPEDANCE_PARAMETERS = ["S11", "S22"]
 DEFAULT_Z0 = 50.0
+CABLE_REQUIRED_COLUMNS = ["cable", "s11r", "s11x", "s21r", "s21x", "s12r", "s12x", "s22r", "s22x"]
+DEFAULT_CABLE_S_PARAMETERS = {
+    "cable1": {
+        "s11": 0.000001 + 0.000001j,
+        "s21": -1.0 + 0.000001j,
+        "s12": -1.0 + 0.000001j,
+        "s22": 0.000001 + 0.000001j,
+    },
+    "cable2": {
+        "s11": 0.000001 + 0.000001j,
+        "s21": -1.0 + 0.000001j,
+        "s12": -1.0 + 0.000001j,
+        "s22": 0.000001 + 0.000001j,
+    },
+}
 
 
 def _read_app_version() -> str:
@@ -104,6 +119,127 @@ def is_float_text(text: str) -> bool:
 
 def clean_column_name(name: str) -> str:
     return str(name).replace("\ufeff", "").strip()
+
+
+def normalize_key(name: str) -> str:
+    return "".join(ch for ch in str(name).strip().lower() if ch.isalnum())
+
+
+def _complex_to_t_matrix(s11: complex, s21: complex, s12: complex, s22: complex, context: str) -> np.ndarray:
+    if abs(s21) <= 1e-18:
+        raise ValueError(f"{context}: S21 is zero; cannot convert S to T.")
+
+    determinant = s11 * s22 - s12 * s21
+    return np.array(
+        [
+            [-determinant / s21, s11 / s21],
+            [-s22 / s21, 1.0 / s21],
+        ],
+        dtype=np.complex128,
+    )
+
+
+def _t_matrix_to_s_parameters(t_matrix: np.ndarray, context: str):
+    a11 = t_matrix[0, 0]
+    a12 = t_matrix[0, 1]
+    a21 = t_matrix[1, 0]
+    a22 = t_matrix[1, 1]
+
+    if abs(a22) <= 1e-18:
+        raise ValueError(f"{context}: T22 is zero; cannot convert T to S.")
+
+    s11 = a12 / a22
+    s21 = 1.0 / a22
+    s12 = -((a11 * a22) - (a12 * a21)) / a22
+    s22 = -a21 / a22
+    return s11, s21, s12, s22
+
+
+def load_cable_s_parameters(file_path: str):
+    if not file_path:
+        return DEFAULT_CABLE_S_PARAMETERS, "default (no cable)"
+
+    raw_df = pd.read_csv(file_path, sep=None, engine="python", encoding="utf-8-sig")
+    if raw_df.empty:
+        raise ValueError("Cable file is empty.")
+
+    rename_map = {}
+    for column in raw_df.columns:
+        normalized = normalize_key(column)
+        if normalized in CABLE_REQUIRED_COLUMNS:
+            rename_map[column] = normalized
+    normalized_df = raw_df.rename(columns=rename_map)
+
+    missing_columns = [column for column in CABLE_REQUIRED_COLUMNS if column not in normalized_df.columns]
+    if missing_columns:
+        raise ValueError(
+            "Cable file is missing required columns: "
+            + ", ".join(missing_columns)
+            + ". Expected cable,S11R,S11X,S21R,S21X,S12R,S12X,S22R,S22X."
+        )
+
+    cable_rows = {}
+    for record in normalized_df.itertuples(index=False):
+        cable_name = normalize_key(getattr(record, "cable"))
+        if cable_name not in ("cable1", "cable2"):
+            continue
+        cable_rows[cable_name] = {
+            "s11": complex(float(getattr(record, "s11r")), float(getattr(record, "s11x"))),
+            "s21": complex(float(getattr(record, "s21r")), float(getattr(record, "s21x"))),
+            "s12": complex(float(getattr(record, "s12r")), float(getattr(record, "s12x"))),
+            "s22": complex(float(getattr(record, "s22r")), float(getattr(record, "s22x"))),
+        }
+
+    for cable_name in ("cable1", "cable2"):
+        if cable_name not in cable_rows:
+            raise ValueError(f"Cable file must include both Cable1 and Cable2 rows. Missing {cable_name}.")
+
+    return cable_rows, file_path
+
+
+def deembed_s_parameters(df: pd.DataFrame, cable_s_parameters: dict) -> pd.DataFrame:
+    cable1 = cable_s_parameters["cable1"]
+    cable2 = cable_s_parameters["cable2"]
+    cable1_t = _complex_to_t_matrix(cable1["s11"], cable1["s21"], cable1["s12"], cable1["s22"], "Cable1")
+    cable2_t = _complex_to_t_matrix(cable2["s11"], cable2["s21"], cable2["s12"], cable2["s22"], "Cable2")
+    cable1_t_inv = np.linalg.inv(cable1_t)
+    cable2_t_inv = np.linalg.inv(cable2_t)
+
+    result_df = df.copy()
+    s11_values = result_df["S11_r"].to_numpy(dtype=float) + 1j * result_df["S11_x"].to_numpy(dtype=float)
+    s21_values = result_df["S21_r"].to_numpy(dtype=float) + 1j * result_df["S21_x"].to_numpy(dtype=float)
+    s12_values = result_df["S12_r"].to_numpy(dtype=float) + 1j * result_df["S12_x"].to_numpy(dtype=float)
+    s22_values = result_df["S22_r"].to_numpy(dtype=float) + 1j * result_df["S22_x"].to_numpy(dtype=float)
+
+    out_s11 = np.empty(len(result_df), dtype=np.complex128)
+    out_s21 = np.empty(len(result_df), dtype=np.complex128)
+    out_s12 = np.empty(len(result_df), dtype=np.complex128)
+    out_s22 = np.empty(len(result_df), dtype=np.complex128)
+
+    for row_index in range(len(result_df)):
+        context = f"Row {row_index + 1}"
+        measured_t = _complex_to_t_matrix(
+            s11_values[row_index],
+            s21_values[row_index],
+            s12_values[row_index],
+            s22_values[row_index],
+            context,
+        )
+        deembedded_t = cable1_t_inv @ measured_t @ cable2_t_inv
+        out_s11[row_index], out_s21[row_index], out_s12[row_index], out_s22[row_index] = _t_matrix_to_s_parameters(
+            deembedded_t,
+            context,
+        )
+
+    result_df["S11_r"] = out_s11.real
+    result_df["S11_x"] = out_s11.imag
+    result_df["S21_r"] = out_s21.real
+    result_df["S21_x"] = out_s21.imag
+    result_df["S12_r"] = out_s12.real
+    result_df["S12_x"] = out_s12.imag
+    result_df["S22_r"] = out_s22.real
+    result_df["S22_x"] = out_s22.imag
+    return result_df
 
 
 def parse_cmd_line(cmd_line: str):
@@ -1294,6 +1430,7 @@ class MatchResolutionGui(QMainWindow):
 
         self.setWindowTitle(f"RF Matching Resolution Tool {APP_VERSION} - Step 1: CMD to X-Y Table")
         self.resize(1400, 850)
+        self.setWindowState(self.windowState() | Qt.WindowMaximized)
 
         self.df_all = None
         self.df_display = None
@@ -1323,6 +1460,7 @@ class MatchResolutionGui(QMainWindow):
         self.smith_efficiency_lookup = {}
         self.efficiency_good_threshold = 0.5
         self.efficiency_poor_threshold = 0.1
+        self.current_cable_source = "default (no cable)"
 
         self.init_ui()
 
@@ -1365,7 +1503,8 @@ class MatchResolutionGui(QMainWindow):
                 padding: 10px;
             }
         """)
-        file_layout = QHBoxLayout(file_frame)
+        file_layout = QVBoxLayout(file_frame)
+        file_layout.setSpacing(8)
 
         self.file_path_edit = QLineEdit()
         self.file_path_edit.setPlaceholderText("Select raw network analyzer data file...")
@@ -1447,12 +1586,53 @@ class MatchResolutionGui(QMainWindow):
             }
         """)
 
-        file_layout.addWidget(QLabel("File:"))
-        file_layout.addWidget(self.file_path_edit, stretch=1)
-        file_layout.addWidget(browse_button)
-        file_layout.addWidget(convert_button)
-        file_layout.addWidget(export_button)
-        file_layout.addWidget(exit_button)
+        main_file_row = QHBoxLayout()
+        main_file_row.addWidget(QLabel("File:"))
+        main_file_row.addWidget(self.file_path_edit, stretch=1)
+        main_file_row.addWidget(browse_button)
+        main_file_row.addWidget(convert_button)
+        main_file_row.addWidget(export_button)
+        main_file_row.addWidget(exit_button)
+        file_layout.addLayout(main_file_row)
+
+        self.cable_file_path_edit = QLineEdit()
+        self.cable_file_path_edit.setPlaceholderText(
+            "Optional cable file (Cable1/Cable2 S-parameters). Leave empty to use default no-cable values."
+        )
+        self.cable_file_path_edit.setStyleSheet("""
+            QLineEdit {
+                background-color: white;
+                border: 2px solid #90A4AE;
+                border-radius: 8px;
+                padding: 8px;
+                font-size: 14px;
+            }
+        """)
+        cable_browse_button = QPushButton("Browse Cable File")
+        cable_browse_button.clicked.connect(self.browse_cable_file)
+        cable_browse_button.setMinimumHeight(38)
+        cable_browse_button.setStyleSheet("""
+            QPushButton {
+                background-color: #455A64;
+                color: white;
+                border-radius: 8px;
+                padding-left: 18px;
+                padding-right: 18px;
+                font-size: 14px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #263238;
+            }
+            QPushButton:pressed {
+                background-color: #1C313A;
+            }
+        """)
+        cable_row = QHBoxLayout()
+        cable_row.addWidget(QLabel("Cable:"))
+        cable_row.addWidget(self.cable_file_path_edit, stretch=1)
+        cable_row.addWidget(cable_browse_button)
+        file_layout.addLayout(cable_row)
 
         main_layout.addWidget(file_frame)
 
@@ -1762,12 +1942,29 @@ class MatchResolutionGui(QMainWindow):
         """)
         smith_toolbar_layout = QHBoxLayout(smith_toolbar)
 
-        smith_toolbar_layout.addWidget(QLabel("Parameter:"))
+        parameter_label = QLabel("Parameter:")
         self.smith_parameter_combo = QComboBox()
         self.smith_parameter_combo.addItems(XY_PARAMETERS)
         self.smith_parameter_combo.setCurrentText("S22")
         self.smith_parameter_combo.currentTextChanged.connect(self.refresh_smith_chart)
-        smith_toolbar_layout.addWidget(self.smith_parameter_combo)
+        self.smith_hover_label = QLabel("Hover a point to see impedance and C1/C2 position.")
+        self.smith_hover_label.setStyleSheet("""
+            QLabel {
+                color: #263238;
+                background-color: #E8F4FD;
+                border: 1px solid #90CAF9;
+                border-radius: 8px;
+                padding: 6px 10px;
+            }
+        """)
+        parameter_layout = QVBoxLayout()
+        parameter_row = QHBoxLayout()
+        parameter_row.addWidget(parameter_label)
+        parameter_row.addWidget(self.smith_parameter_combo)
+        parameter_row.addStretch(1)
+        parameter_layout.addLayout(parameter_row)
+        parameter_layout.addWidget(self.smith_hover_label)
+        smith_toolbar_layout.addLayout(parameter_layout)
         self.smith_conjugate_button = QPushButton("Conjugate")
         self.smith_conjugate_button.setCheckable(True)
         self.smith_conjugate_button.toggled.connect(self.toggle_smith_conjugate)
@@ -1786,17 +1983,6 @@ class MatchResolutionGui(QMainWindow):
         """)
         smith_toolbar_layout.addWidget(self.smith_status_label, stretch=1)
         smith_toolbar_layout.addStretch(1)
-        self.smith_hover_label = QLabel("Hover a point to see impedance and C1/C2 position.")
-        self.smith_hover_label.setStyleSheet("""
-            QLabel {
-                color: #263238;
-                background-color: #E8F4FD;
-                border: 1px solid #90CAF9;
-                border-radius: 8px;
-                padding: 6px 10px;
-            }
-        """)
-        smith_toolbar_layout.addWidget(self.smith_hover_label, stretch=1)
 
         smith_mode_frame = QFrame()
         smith_mode_frame.setStyleSheet("""
@@ -1905,6 +2091,8 @@ class MatchResolutionGui(QMainWindow):
         search_layout = QVBoxLayout(search_frame)
         search_layout.addWidget(QLabel("Search load impedance by C1% / C2%"))
         search_grid = QGridLayout()
+        search_grid.setHorizontalSpacing(10)
+        search_grid.setVerticalSpacing(8)
         search_grid.addWidget(QLabel("C1%"), 0, 0)
         self.zl_search_c1_edit = QLineEdit()
         self.zl_search_c1_edit.setFixedWidth(60)
@@ -1916,15 +2104,14 @@ class MatchResolutionGui(QMainWindow):
         self.zl_search_c2_edit.setValidator(QDoubleValidator(0.0, 100.0, 2))
         search_grid.addWidget(self.zl_search_c2_edit, 0, 3)
         self.zl_search_button = QPushButton("Search ZL")
+        self.zl_search_button.setMinimumWidth(90)
         self.zl_search_button.clicked.connect(self._search_load_impedance)
-        search_grid.addWidget(self.zl_search_button, 0, 4)
-        search_layout.addLayout(search_grid)
-        search_carry_row = QHBoxLayout()
+        search_grid.addWidget(self.zl_search_button, 1, 1, alignment=Qt.AlignLeft)
         self.manual_carry_button = QPushButton("Carry Over")
+        self.manual_carry_button.setMinimumWidth(90)
         self.manual_carry_button.clicked.connect(self._carry_over_search_result)
-        search_carry_row.addWidget(self.manual_carry_button)
-        search_carry_row.addStretch(1)
-        search_layout.addLayout(search_carry_row)
+        search_grid.addWidget(self.manual_carry_button, 1, 3, alignment=Qt.AlignLeft)
+        search_layout.addLayout(search_grid)
         self.zl_search_result_label = QLabel("ZL search result will appear here.")
         self.zl_search_result_label.setWordWrap(True)
         self.zl_search_result_label.setStyleSheet("""
@@ -1939,7 +2126,7 @@ class MatchResolutionGui(QMainWindow):
         search_layout.addWidget(self.zl_search_result_label)
 
         manual_frame.setMaximumWidth(360)
-        search_frame.setMaximumWidth(280)
+        search_frame.setMaximumWidth(340)
         smith_tools_stack = QWidget()
         smith_tools_stack_layout = QVBoxLayout(smith_tools_stack)
         smith_tools_stack_layout.setContentsMargins(0, 0, 0, 0)
@@ -3493,8 +3680,19 @@ class MatchResolutionGui(QMainWindow):
         if file_path:
             self.file_path_edit.setText(file_path)
 
+    def browse_cable_file(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select cable S-parameter file",
+            "",
+            "Data Files (*.csv *.txt *.dat *.s2p *.log);;All Files (*)"
+        )
+        if file_path:
+            self.cable_file_path_edit.setText(file_path)
+
     def convert_file(self):
         file_path = self.file_path_edit.text().strip()
+        cable_file_path = self.cable_file_path_edit.text().strip()
 
         if not file_path:
             QMessageBox.warning(self, "No File", "Please select a raw data file first.")
@@ -3504,10 +3702,17 @@ class MatchResolutionGui(QMainWindow):
             QMessageBox.critical(self, "File Error", "The selected file does not exist.")
             return
 
+        if cable_file_path and not os.path.exists(cable_file_path):
+            QMessageBox.critical(self, "Cable File Error", "The selected cable file does not exist.")
+            return
+
         try:
             QApplication.setOverrideCursor(Qt.WaitCursor)
 
             self.df_all = parse_match_file(file_path)
+            cable_s_parameters, cable_source = load_cable_s_parameters(cable_file_path)
+            self.df_all = deembed_s_parameters(self.df_all, cable_s_parameters)
+            self.current_cable_source = cable_source
             self.df_display = self.df_all.head(5000).copy()
             self.refresh_display_table()
             self.refresh_xy_table()
@@ -3549,12 +3754,13 @@ class MatchResolutionGui(QMainWindow):
                 self,
                 "Convert Finished",
                 f"Successfully converted {total_rows:,} rows.\n\n"
-            f"X-Y tab uses {self.current_xy_parameter}.\n"
-            f"Impedance tab uses {self.current_impedance_parameter}.\n"
-            f"dZ tab uses {self.current_dz_parameter}.\n"
-            f"Reflect Coefficient tab uses {self.current_reflection_parameter} {self.current_reflection_mode}.\n"
-            f"Efficiency tab uses {self.efficiency_mode_combo.currentText()}.\n"
-            f"Smith Chart uses {self.current_smith_parameter}."
+                f"Cable de-embed source: {self.current_cable_source}\n"
+                f"X-Y tab uses {self.current_xy_parameter}.\n"
+                f"Impedance tab uses {self.current_impedance_parameter}.\n"
+                f"dZ tab uses {self.current_dz_parameter}.\n"
+                f"Reflect Coefficient tab uses {self.current_reflection_parameter} {self.current_reflection_mode}.\n"
+                f"Efficiency tab uses {self.efficiency_mode_combo.currentText()}.\n"
+                f"Smith Chart uses {self.current_smith_parameter}."
             )
 
         except Exception as e:
