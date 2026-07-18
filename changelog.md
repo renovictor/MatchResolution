@@ -3,6 +3,7 @@
 ## V1.0.6
 
 - Switched application version to load from the root `VERSION` file so releases only require changing one version source.
+- Fixed one-file executable startup by bundling `VERSION` in PyInstaller builds and adding frozen-app version path fallback.
 
 ## V1.0.5
 
