@@ -1,5 +1,11 @@
 # Changelog
 
+## V1.0.7
+
+- Added a custom splash screen with version and startup progress.
+- Added Phase Magnitude, Contour, and P/M Smith Chart modes.
+- Added Smith Chart image saving and contour edge display.
+
 ## V1.0.6
 
 - Switched application version to load from the root `VERSION` file so releases only require changing one version source.
