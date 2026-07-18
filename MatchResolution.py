@@ -62,13 +62,36 @@ REDUCED_GRID_ROWS = 7 * 8 * 7 * 8
 XY_PARAMETERS = ["S11", "S21", "S12", "S22"]
 IMPEDANCE_PARAMETERS = ["S11", "S22"]
 DEFAULT_Z0 = 50.0
-_BASE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-VERSION_FILE = os.path.join(_BASE_DIR, "VERSION")
-with open(VERSION_FILE, encoding="utf-8") as version_file:
-    _version_text = version_file.read().strip()
-if not _version_text:
-    raise ValueError(f"VERSION file is empty: {VERSION_FILE}")
-APP_VERSION = _version_text if _version_text.upper().startswith("V") else f"V{_version_text}"
+
+
+def _read_app_version() -> str:
+    candidate_dirs = []
+    if hasattr(sys, "_MEIPASS"):
+        candidate_dirs.append(getattr(sys, "_MEIPASS"))
+    candidate_dirs.extend([
+        os.path.dirname(os.path.abspath(__file__)),
+        os.path.dirname(os.path.abspath(sys.executable)),
+    ])
+
+    checked_paths = []
+    for base_dir in candidate_dirs:
+        version_path = os.path.join(base_dir, "VERSION")
+        checked_paths.append(version_path)
+        if not os.path.isfile(version_path):
+            continue
+
+        with open(version_path, encoding="utf-8") as version_file:
+            version_text = version_file.read().strip()
+        if not version_text:
+            raise ValueError(f"VERSION file is empty: {version_path}")
+        return version_text if version_text.upper().startswith("V") else f"V{version_text}"
+
+    raise FileNotFoundError(
+        "VERSION file not found. Checked: " + ", ".join(checked_paths)
+    )
+
+
+APP_VERSION = _read_app_version()
 
 
 def is_float_text(text: str) -> bool:
