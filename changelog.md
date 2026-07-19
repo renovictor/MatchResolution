@@ -1,5 +1,11 @@
 # Changelog
 
+## V1.0.8
+
+- Changed application window icon, taskbar icon, and EXE file icon to `smithchart.ico`.
+- Updated `build_exe.ps1` to bundle `smithchart.ico` into the PyInstaller build (`--icon` and `--add-data`) so the icon works in both Python and EXE modes.
+- Reflect Coefficient tab: removed the "Mode" dropdown and now renders **both** horizontal (ΔC1) and vertical (ΔC2) |ΔΓ| heatmaps side by side at the same time instead of showing only one at a time.
+
 ## V1.0.7
 
 - Added a custom splash screen with version and startup progress.
