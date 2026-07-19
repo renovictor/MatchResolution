@@ -1,12 +1,11 @@
+from __future__ import annotations
+
 import os
 import re
 import sys
 
-import numpy as np
-import pandas as pd
-
 from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QEventLoop, QElapsedTimer, QTimer
-from PySide6.QtGui import QColor, QBrush, QFont, QDoubleValidator
+from PySide6.QtGui import QColor, QBrush, QFont, QDoubleValidator, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -31,24 +30,6 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSplitter,
 )
-
-try:
-    import matplotlib as _matplotlib
-    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
-    from matplotlib.figure import Figure
-    from matplotlib.colors import Normalize
-    import matplotlib.cm as _mpl_cm
-
-    def _get_cmap(name):
-        """Compatibility: matplotlib ≥3.9 removed cm.get_cmap; use colormaps registry."""
-        if hasattr(_matplotlib, "colormaps"):
-            return _matplotlib.colormaps[name]
-        return _mpl_cm.get_cmap(name)   # matplotlib < 3.9 fallback
-
-    _MATPLOTLIB_OK = True
-except ImportError:
-    _MATPLOTLIB_OK = False
-
 
 EXPECTED_S_COLUMNS = [
     "S11_r", "S11_x",
@@ -80,11 +61,58 @@ DEFAULT_CABLE_S_PARAMETERS = {
     },
 }
 
+np = None
+pd = None
+_matplotlib = None
+FigureCanvas = None
+Figure = None
+Normalize = None
+_mpl_cm = None
+_MATPLOTLIB_OK = False
+
+
+def load_runtime_libraries():
+    global np, pd, _matplotlib, FigureCanvas, Figure, Normalize, _mpl_cm, _MATPLOTLIB_OK
+
+    import numpy as _np
+    import pandas as _pd
+    np = _np
+    pd = _pd
+
+    try:
+        import matplotlib as _matplotlib_module
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as _FigureCanvas
+        from matplotlib.figure import Figure as _Figure
+        from matplotlib.colors import Normalize as _Normalize
+        import matplotlib.cm as _mpl_cm_module
+
+        _matplotlib = _matplotlib_module
+        FigureCanvas = _FigureCanvas
+        Figure = _Figure
+        Normalize = _Normalize
+        _mpl_cm = _mpl_cm_module
+
+        def _get_cmap(name):
+            """Compatibility: matplotlib ≥3.9 removed cm.get_cmap; use colormaps registry."""
+            if hasattr(_matplotlib, "colormaps"):
+                return _matplotlib.colormaps[name]
+            return _mpl_cm.get_cmap(name)   # matplotlib < 3.9 fallback
+
+        globals()["_get_cmap"] = _get_cmap
+        _MATPLOTLIB_OK = True
+    except ImportError:
+        _MATPLOTLIB_OK = False
+
 
 def app_base_path():
     if hasattr(sys, "_MEIPASS"):
         return getattr(sys, "_MEIPASS")
     return os.path.dirname(os.path.abspath(__file__))
+
+
+def load_app_icon() -> QIcon:
+    icon_path = os.path.join(app_base_path(), "smithchart.ico")
+    return QIcon(icon_path)
 
 
 class StartupSplash(QWidget):
@@ -2597,14 +2625,7 @@ class MatchResolutionGui(QMainWindow):
         self.reflection_parameter_combo.currentTextChanged.connect(self.refresh_reflection_table)
         reflection_toolbar_layout.addWidget(self.reflection_parameter_combo)
 
-        reflection_toolbar_layout.addWidget(QLabel("Mode:"))
-        self.reflection_mode_combo = QComboBox()
-        self.reflection_mode_combo.addItems(["horizontal", "vertical"])
-        self.reflection_mode_combo.setCurrentText("horizontal")
-        self.reflection_mode_combo.currentTextChanged.connect(self.refresh_reflection_table)
-        reflection_toolbar_layout.addWidget(self.reflection_mode_combo)
-
-        reflection_toolbar_layout.addWidget(QLabel("Reflect coefficient resolution: cell[n] = value[n] - value[n-1]."))
+        reflection_toolbar_layout.addWidget(QLabel("Reflect coefficient resolution: cell[n] = value[n] - value[n-1]. Both horizontal (ΔC1) and vertical (ΔC2) maps shown."))
         self.reflection_cell_label = QLabel("Click a cell to see the value here.")
         self.reflection_cell_label.setStyleSheet("""
             QLabel {
@@ -2687,7 +2708,7 @@ class MatchResolutionGui(QMainWindow):
         reflection_plot_layout.addWidget(self.reflection_status_label)
 
         if _MATPLOTLIB_OK:
-            self.reflection_figure = Figure(figsize=(8, 6))
+            self.reflection_figure = Figure(figsize=(14, 6))
             self.reflection_canvas = FigureCanvas(self.reflection_figure)
             self.reflection_canvas.setMinimumHeight(320)
             reflection_plot_layout.addWidget(self.reflection_canvas)
@@ -3370,11 +3391,11 @@ class MatchResolutionGui(QMainWindow):
             return
 
         self.current_reflection_parameter = self.reflection_parameter_combo.currentText().strip()
-        self.current_reflection_mode = self.reflection_mode_combo.currentText().strip()
+        # Table always shows horizontal mode; heatmap shows both maps simultaneously
         self.df_reflection_display = build_reflection_display_table(
             self.df_all,
             self.current_reflection_parameter,
-            self.current_reflection_mode,
+            "horizontal",
         )
 
         self.reflection_table_model = PandasTableModel(self.df_reflection_display)
@@ -3534,53 +3555,61 @@ class MatchResolutionGui(QMainWindow):
         horizontal, vertical, x_values, y_values = build_delta_reflection_plot_data(
             self.df_all, self.current_reflection_parameter
         )
-        delta_matrix = horizontal if self.current_reflection_mode == "horizontal" else vertical
-        magnitude_matrix = np.abs(delta_matrix)
-        finite_values = magnitude_matrix[np.isfinite(magnitude_matrix)]
-        if finite_values.size == 0:
+        h_mag = np.abs(horizontal)
+        v_mag = np.abs(vertical)
+        all_finite = np.concatenate([
+            h_mag[np.isfinite(h_mag)],
+            v_mag[np.isfinite(v_mag)],
+        ])
+        if all_finite.size == 0:
             if show_message_on_error:
                 QMessageBox.warning(self, "No Data", "No reflection-coefficient values were available to plot.")
             return
 
-        v_min = float(finite_values.min())
-        v_avg = float(finite_values.mean())
-        v_max = float(finite_values.max())
+        v_min = float(all_finite.min())
+        v_avg = float(all_finite.mean())
+        v_max = float(all_finite.max())
 
         self.reflection_status_label.setText(
-            f"{self.current_reflection_parameter} {self.current_reflection_mode} |ΔΓ|: min {v_min:.4g}, avg {v_avg:.4g}, max {v_max:.4g} | "
+            f"{self.current_reflection_parameter} |ΔΓ| (both maps): min {v_min:.4g}, avg {v_avg:.4g}, max {v_max:.4g} | "
             f"green≤{good_threshold:g}, red≥{poor_threshold:g}"
         )
-        self._draw_reflection_plot(magnitude_matrix, x_values, y_values, good_threshold, poor_threshold)
+        self._draw_reflection_plot(h_mag, v_mag, x_values, y_values, good_threshold, poor_threshold)
 
-    def _draw_reflection_plot(self, magnitude_matrix, x_values, y_values, good_threshold, poor_threshold):
+    def _draw_reflection_plot(self, h_mag, v_mag, x_values, y_values, good_threshold, poor_threshold):
         self.reflection_figure.clear()
-        ax = self.reflection_figure.add_subplot(111)
-
         cmap = _get_cmap("RdYlGn_r")
         norm = Normalize(vmin=good_threshold, vmax=poor_threshold, clip=True)
-        im = ax.imshow(
-            magnitude_matrix,
-            aspect="auto",
-            origin="lower",
-            cmap=cmap,
-            norm=norm,
-            interpolation="nearest",
-            extent=[0, len(x_values), 0, len(y_values)],
-        )
-        ax.set_xlabel("C1 Position (0 - 447)", fontsize=9)
-        ax.set_ylabel("C2 Position (0 - 447)", fontsize=9)
-        ax.set_title(
-            f"Reflect Coefficient |ΔΓ| Map - {self.current_reflection_parameter} ({self.current_reflection_mode})",
-            fontsize=11,
-            fontweight="bold",
-        )
-        ax.tick_params(labelsize=8)
-        for boundary in range(64, max(len(x_values), len(y_values)), 64):
-            ax.axvline(boundary, color="white", linewidth=0.35, alpha=0.5)
-            ax.axhline(boundary, color="white", linewidth=0.35, alpha=0.5)
 
-        colorbar = self.reflection_figure.colorbar(im, ax=ax, pad=0.02)
-        colorbar.set_label(f"|ΔΓ|  (green <= {good_threshold:g}, red >= {poor_threshold:g})", fontsize=9)
+        for ax, matrix, direction in (
+            (self.reflection_figure.add_subplot(1, 2, 1), h_mag, "Horizontal (ΔC1)"),
+            (self.reflection_figure.add_subplot(1, 2, 2), v_mag, "Vertical (ΔC2)"),
+        ):
+            im = ax.imshow(
+                matrix,
+                aspect="auto",
+                origin="lower",
+                cmap=cmap,
+                norm=norm,
+                interpolation="nearest",
+                extent=[0, len(x_values), 0, len(y_values)],
+            )
+            ax.set_xlabel("C1 Position", fontsize=9)
+            ax.set_ylabel("C2 Position", fontsize=9)
+            ax.set_title(
+                f"|ΔΓ| {direction} — {self.current_reflection_parameter}",
+                fontsize=10,
+                fontweight="bold",
+            )
+            ax.tick_params(labelsize=8)
+            for boundary in range(64, max(len(x_values), len(y_values)), 64):
+                ax.axvline(boundary, color="white", linewidth=0.35, alpha=0.5)
+                ax.axhline(boundary, color="white", linewidth=0.35, alpha=0.5)
+            self.reflection_figure.colorbar(im, ax=ax, pad=0.02).set_label(
+                f"|ΔΓ|  green≤{good_threshold:g}  red≥{poor_threshold:g}", fontsize=8
+            )
+
+        self.reflection_figure.tight_layout()
         self.reflection_canvas.draw()
 
     def refresh_smith_chart(self):
@@ -4404,7 +4433,13 @@ class MatchResolutionGui(QMainWindow):
 
 
 if __name__ == "__main__":
+    if sys.platform == "win32":
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ASM.MatchResolution")
+
     app = QApplication(sys.argv)
+    app_icon = load_app_icon()
+    app.setWindowIcon(app_icon)
 
     app.setStyleSheet("""
         QMainWindow {
@@ -4420,13 +4455,17 @@ if __name__ == "__main__":
         app.processEvents()
 
     startup_splash = StartupSplash()
+    startup_splash.setWindowIcon(app_icon)
     startup_splash.show()
     app.processEvents()
 
     startup_timer = QElapsedTimer()
     startup_timer.start()
-    startup_status("Loading application...", 5)
+    startup_status("Loading numerical libraries...", 5)
+    load_runtime_libraries()
+    startup_status("Building main window...", 35)
     window = MatchResolutionGui(startup_status_callback=startup_status)
+    window.setWindowIcon(app_icon)
 
     remaining_ms = 10000 - int(startup_timer.elapsed())
     if remaining_ms > 0:

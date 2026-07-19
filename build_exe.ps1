@@ -40,7 +40,12 @@ Write-Host "Building executable..." -ForegroundColor Yellow
 # Build the executable
 $exeName = "MatchResolution_V$version"
 $versionFile = (Resolve-Path "VERSION").Path
-python -m PyInstaller --onefile --windowed --name $exeName --distpath dist --workpath build --specpath build --add-data "$versionFile;." MatchResolution.py
+if (-not (Test-Path "smithchart.ico")) {
+    Write-Host "smithchart.ico not found" -ForegroundColor Red
+    exit 1
+}
+$iconPath = (Resolve-Path "smithchart.ico").Path
+python -m PyInstaller --onefile --windowed --name $exeName --distpath dist --workpath build --specpath build --icon $iconPath --add-data "$versionFile;." --add-data "$iconPath;." MatchResolution.py
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Build failed" -ForegroundColor Red
