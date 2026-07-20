@@ -5,6 +5,7 @@
 - Changed application window icon, taskbar icon, and EXE file icon to `smithchart.ico`.
 - Updated `build_exe.ps1` to bundle `smithchart.ico` into the PyInstaller build (`--icon` and `--add-data`) so the icon works in both Python and EXE modes.
 - Reflect Coefficient tab: removed the "Mode" dropdown and now renders **both** horizontal (ΔC1) and vertical (ΔC2) |ΔΓ| heatmaps side by side at the same time instead of showing only one at a time.
+- Smith Chart tab: added a `Demo` button between `Search ZL` and `Carry Over` that automatically runs `C1%=C2%=0,10,...,100` with the sequence `Search ZL → Carry Over → Plot Points` for each step.
 
 ## V1.0.7
 

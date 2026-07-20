@@ -2303,6 +2303,17 @@ class MatchResolutionGui(QMainWindow):
         """)
         self.dz_plot_button.clicked.connect(self.plot_dz_resolution)
         dz_plot_controls.addWidget(self.dz_plot_button)
+        dz_plot_controls.addSpacing(16)
+        dz_plot_controls.addWidget(QLabel("Heatmap min:"))
+        self.dz_heatmap_min_edit = QLineEdit("0.001")
+        self.dz_heatmap_min_edit.setFixedWidth(90)
+        self.dz_heatmap_min_edit.setValidator(QDoubleValidator(0.0, 1e12, 6))
+        dz_plot_controls.addWidget(self.dz_heatmap_min_edit)
+        dz_plot_controls.addWidget(QLabel("Heatmap max:"))
+        self.dz_heatmap_max_edit = QLineEdit("1")
+        self.dz_heatmap_max_edit.setFixedWidth(90)
+        self.dz_heatmap_max_edit.setValidator(QDoubleValidator(0.0, 1e12, 6))
+        dz_plot_controls.addWidget(self.dz_heatmap_max_edit)
         dz_plot_controls.addStretch(1)
         dz_plot_layout.addLayout(dz_plot_controls)
 
@@ -2311,7 +2322,7 @@ class MatchResolutionGui(QMainWindow):
         dz_plot_layout.addWidget(self.dz_status_label)
 
         if _MATPLOTLIB_OK:
-            self.dz_figure = Figure(figsize=(14, 6))
+            self.dz_figure = Figure(figsize=(21, 6))
             self.dz_canvas = FigureCanvas(self.dz_figure)
             self.dz_canvas.setMinimumHeight(320)
             dz_plot_layout.addWidget(self.dz_canvas)
@@ -2524,6 +2535,10 @@ class MatchResolutionGui(QMainWindow):
         self.zl_search_button.setMinimumWidth(90)
         self.zl_search_button.clicked.connect(self._search_load_impedance)
         search_grid.addWidget(self.zl_search_button, 1, 1, alignment=Qt.AlignLeft)
+        self.zl_demo_button = QPushButton("Demo")
+        self.zl_demo_button.setMinimumWidth(80)
+        self.zl_demo_button.clicked.connect(self._run_smith_demo_points)
+        search_grid.addWidget(self.zl_demo_button, 1, 2, alignment=Qt.AlignLeft)
         self.manual_carry_button = QPushButton("Carry Over")
         self.manual_carry_button.setMinimumWidth(90)
         self.manual_carry_button.clicked.connect(self._carry_over_search_result)
@@ -2700,6 +2715,17 @@ class MatchResolutionGui(QMainWindow):
         """)
         self.reflection_plot_button.clicked.connect(self.plot_reflection_resolution)
         reflection_plot_controls.addWidget(self.reflection_plot_button)
+        reflection_plot_controls.addSpacing(16)
+        reflection_plot_controls.addWidget(QLabel("Heatmap min:"))
+        self.reflection_heatmap_min_edit = QLineEdit("0")
+        self.reflection_heatmap_min_edit.setFixedWidth(90)
+        self.reflection_heatmap_min_edit.setValidator(QDoubleValidator(0.0, 1e12, 6))
+        reflection_plot_controls.addWidget(self.reflection_heatmap_min_edit)
+        reflection_plot_controls.addWidget(QLabel("Heatmap max:"))
+        self.reflection_heatmap_max_edit = QLineEdit("0.03")
+        self.reflection_heatmap_max_edit.setFixedWidth(90)
+        self.reflection_heatmap_max_edit.setValidator(QDoubleValidator(0.0, 1e12, 6))
+        reflection_plot_controls.addWidget(self.reflection_heatmap_max_edit)
         reflection_plot_controls.addStretch(1)
         reflection_plot_layout.addLayout(reflection_plot_controls)
 
@@ -2708,7 +2734,7 @@ class MatchResolutionGui(QMainWindow):
         reflection_plot_layout.addWidget(self.reflection_status_label)
 
         if _MATPLOTLIB_OK:
-            self.reflection_figure = Figure(figsize=(14, 6))
+            self.reflection_figure = Figure(figsize=(21, 6))
             self.reflection_canvas = FigureCanvas(self.reflection_figure)
             self.reflection_canvas.setMinimumHeight(320)
             reflection_plot_layout.addWidget(self.reflection_canvas)
@@ -2825,7 +2851,7 @@ class MatchResolutionGui(QMainWindow):
         main_layout.addWidget(self.tabs, stretch=1)
 
         note = QLabel(
-            "Note: Display tab shows the converted row table. X-Y Table shows the grid view for the selected S-parameter. dZ shows delta impedance for S22. Reflect Coefficient tab shows delta-Γ resolution from X-Y data. Efficiency tab lets you switch between |S21|² and ηoverall = (1 - |S11|²) × |S21|². Smith Chart supports X-Y Table, dZ, dΓ, Efficiency coloring modes, manual R/X points, and ZL search by C1/C2."
+            "Note: Display tab shows the converted row table. X-Y Table shows the grid view for the selected S-parameter. dZ shows delta impedance for S22. Reflect Coefficient tab shows delta-Γ resolution from X-Y data. Efficiency tab lets you switch between |S21|² and ηoverall = (1 - |S11|²) × |S21|². Smith Chart supports X-Y Table, dZ, dΓ, Efficiency coloring modes, manual R/X points, ZL search by C1/C2, and one-click demo plotting."
         )
         note.setAlignment(Qt.AlignCenter)
         note.setStyleSheet("font-size: 13px; color: #607D8B; padding: 6px;")
@@ -3552,6 +3578,8 @@ class MatchResolutionGui(QMainWindow):
             return
         good_threshold, poor_threshold = thresholds
 
+        heatmap_range = self._get_reflection_heatmap_range()
+
         horizontal, vertical, x_values, y_values = build_delta_reflection_plot_data(
             self.df_all, self.current_reflection_parameter
         )
@@ -3570,21 +3598,44 @@ class MatchResolutionGui(QMainWindow):
         v_avg = float(all_finite.mean())
         v_max = float(all_finite.max())
 
+        heatmap_data = np.minimum(h_mag, v_mag)
+        heat_finite = heatmap_data[np.isfinite(heatmap_data)]
+        heat_min = float(heat_finite.min()) if heat_finite.size else 0.0
+        heat_avg = float(heat_finite.mean()) if heat_finite.size else 0.0
+        heat_max = float(heat_finite.max()) if heat_finite.size else 0.0
+
         self.reflection_status_label.setText(
             f"{self.current_reflection_parameter} |ΔΓ| (both maps): min {v_min:.4g}, avg {v_avg:.4g}, max {v_max:.4g} | "
-            f"green≤{good_threshold:g}, red≥{poor_threshold:g}"
+            f"green≤{good_threshold:g}, red≥{poor_threshold:g} | "
+            f"Heatmap min(H,V): min {heat_min:.4g}, avg {heat_avg:.4g}, max {heat_max:.4g}"
         )
-        self._draw_reflection_plot(h_mag, v_mag, x_values, y_values, good_threshold, poor_threshold)
+        self._draw_reflection_plot(h_mag, v_mag, heatmap_data, x_values, y_values,
+                                   good_threshold, poor_threshold, heatmap_range)
 
-    def _draw_reflection_plot(self, h_mag, v_mag, x_values, y_values, good_threshold, poor_threshold):
+    def _get_reflection_heatmap_range(self):
+        """Return (vmin, vmax) for the reflection heatmap colour scale, or None if invalid."""
+        try:
+            vmin = float(self.reflection_heatmap_min_edit.text().strip() or "0")
+            vmax = float(self.reflection_heatmap_max_edit.text().strip() or "0")
+        except ValueError:
+            return None
+        if vmin < 0 or vmax <= 0 or vmin >= vmax:
+            return None
+        return vmin, vmax
+
+    def _draw_reflection_plot(self, h_mag, v_mag, heatmap_data, x_values, y_values,
+                               good_threshold, poor_threshold, heatmap_range=None):
         self.reflection_figure.clear()
         cmap = _get_cmap("RdYlGn_r")
         norm = Normalize(vmin=good_threshold, vmax=poor_threshold, clip=True)
 
-        for ax, matrix, direction in (
-            (self.reflection_figure.add_subplot(1, 2, 1), h_mag, "Horizontal (ΔC1)"),
-            (self.reflection_figure.add_subplot(1, 2, 2), v_mag, "Vertical (ΔC2)"),
-        ):
+        gs = self.reflection_figure.add_gridspec(1, 3, wspace=0.35, left=0.04, right=0.97, top=0.92, bottom=0.08)
+
+        for subplot_idx, (matrix, direction) in enumerate((
+            (h_mag, "Horizontal (ΔC1)"),
+            (v_mag, "Vertical (ΔC2)"),
+        )):
+            ax = self.reflection_figure.add_subplot(gs[0, subplot_idx])
             im = ax.imshow(
                 matrix,
                 aspect="auto",
@@ -3609,7 +3660,36 @@ class MatchResolutionGui(QMainWindow):
                 f"|ΔΓ|  green≤{good_threshold:g}  red≥{poor_threshold:g}", fontsize=8
             )
 
-        self.reflection_figure.tight_layout()
+        # Heatmap: min(horizontal, vertical) — best achievable resolution at each point
+        ax_heat = self.reflection_figure.add_subplot(gs[0, 2])
+        if heatmap_range is not None:
+            heat_vmin, heat_vmax = heatmap_range
+        else:
+            heat_vmin, heat_vmax = good_threshold, poor_threshold
+        heat_norm = Normalize(vmin=heat_vmin, vmax=heat_vmax, clip=True)
+        heat_im = ax_heat.imshow(
+            heatmap_data,
+            aspect="auto",
+            origin="lower",
+            cmap=cmap,
+            norm=heat_norm,
+            interpolation="nearest",
+            extent=[0, len(x_values), 0, len(y_values)],
+        )
+        ax_heat.set_title(
+            f"Heatmap: min(H, V) |ΔΓ| — {self.current_reflection_parameter}",
+            fontsize=10,
+            fontweight="bold",
+        )
+        ax_heat.set_xlabel("C1 Position", fontsize=9)
+        ax_heat.set_ylabel("C2 Position", fontsize=9)
+        ax_heat.tick_params(labelsize=8)
+        for boundary in range(64, max(len(x_values), len(y_values)), 64):
+            ax_heat.axvline(boundary, color="white", linewidth=0.35, alpha=0.5)
+            ax_heat.axhline(boundary, color="white", linewidth=0.35, alpha=0.5)
+        heat_cb = self.reflection_figure.colorbar(heat_im, ax=ax_heat, pad=0.02)
+        heat_cb.set_label(f"|ΔΓ|  [{heat_vmin:g} – {heat_vmax:g}]", fontsize=8)
+
         self.reflection_canvas.draw()
 
     def refresh_smith_chart(self):
@@ -3732,6 +3812,31 @@ class MatchResolutionGui(QMainWindow):
         row_number = self.manual_impedance_model.set_next_available_point(impedance.real, impedance.imag)
         self.manual_impedance_status_label.setText(
             f"Carried ZL = {format_impedance_text(impedance)} into manual row {row_number}."
+        )
+
+    def _run_smith_demo_points(self):
+        if self.df_all is None or self.df_all.empty:
+            QMessageBox.warning(self, "No Data", "Please convert data before running demo.")
+            return
+        if self.manual_impedance_model is None:
+            return
+
+        self._clear_manual_impedance_points()
+        self.smith_search_result = None
+
+        demo_percentages = list(range(0, 101, 10))
+        for pct in demo_percentages:
+            pct_text = str(pct)
+            self.zl_search_c1_edit.setText(pct_text)
+            self.zl_search_c2_edit.setText(pct_text)
+            self._search_load_impedance()
+            if self.smith_search_result is None:
+                return
+            self._carry_over_search_result()
+            self._plot_manual_impedance_points()
+
+        self.manual_impedance_status_label.setText(
+            "Demo complete: plotted points for C1/C2 = 0%, 10%, ..., 100%."
         )
 
     def _plot_manual_impedance_points(self):
@@ -4189,6 +4294,8 @@ class MatchResolutionGui(QMainWindow):
             return
         good_threshold, poor_threshold = thresholds
 
+        heatmap_range = self._get_dz_heatmap_range()
+
         horizontal, vertical, x_values, y_values = build_delta_impedance_plot_data(self.df_all)
         horizontal_finite = horizontal[np.isfinite(horizontal)]
         vertical_finite = vertical[np.isfinite(vertical)]
@@ -4204,22 +4311,43 @@ class MatchResolutionGui(QMainWindow):
         v_avg = vertical_finite.mean() if vertical_finite.size else 0.0
         v_max = vertical_finite.max() if vertical_finite.size else 0.0
 
+        heatmap_data = np.minimum(horizontal, vertical)
+        heat_finite = heatmap_data[np.isfinite(heatmap_data)]
+        heat_min = heat_finite.min() if heat_finite.size else 0.0
+        heat_avg = heat_finite.mean() if heat_finite.size else 0.0
+        heat_max = heat_finite.max() if heat_finite.size else 0.0
+
         self.dz_status_label.setText(
             f"Horizontal |ΔZ|: min {h_min:.4g} Ω, avg {h_avg:.4g} Ω, max {h_max:.4g} Ω | "
-            f"Vertical |ΔZ|: min {v_min:.4g} Ω, avg {v_avg:.4g} Ω, max {v_max:.4g} Ω"
+            f"Vertical |ΔZ|: min {v_min:.4g} Ω, avg {v_avg:.4g} Ω, max {v_max:.4g} Ω | "
+            f"Heatmap min(H,V): min {heat_min:.4g} Ω, avg {heat_avg:.4g} Ω, max {heat_max:.4g} Ω"
         )
 
-        self._draw_dz_plots(horizontal, vertical, x_values, y_values, good_threshold, poor_threshold)
+        self._draw_dz_plots(horizontal, vertical, heatmap_data, x_values, y_values,
+                            good_threshold, poor_threshold, heatmap_range)
 
-    def _draw_dz_plots(self, horizontal, vertical, x_values, y_values, good_threshold, poor_threshold):
+    def _get_dz_heatmap_range(self):
+        """Return (vmin, vmax) for the heatmap colour scale, or None if inputs are invalid."""
+        try:
+            vmin = float(self.dz_heatmap_min_edit.text().strip() or "0")
+            vmax = float(self.dz_heatmap_max_edit.text().strip() or "0")
+        except ValueError:
+            return None
+        if vmin < 0 or vmax <= 0 or vmin >= vmax:
+            return None
+        return vmin, vmax
+
+    def _draw_dz_plots(self, horizontal, vertical, heatmap_data, x_values, y_values,
+                       good_threshold, poor_threshold, heatmap_range=None):
         self.dz_figure.clear()
 
         cmap = _get_cmap("RdYlGn_r")
         norm = Normalize(vmin=good_threshold, vmax=poor_threshold, clip=True)
 
-        gs = self.dz_figure.add_gridspec(1, 2, wspace=0.18, left=0.05, right=0.92, top=0.9, bottom=0.08)
+        gs = self.dz_figure.add_gridspec(1, 3, wspace=0.28, left=0.04, right=0.97, top=0.9, bottom=0.08)
         ax_left = self.dz_figure.add_subplot(gs[0, 0])
         ax_right = self.dz_figure.add_subplot(gs[0, 1])
+        ax_heat = self.dz_figure.add_subplot(gs[0, 2])
 
         left_im = ax_left.imshow(
             horizontal,
@@ -4252,6 +4380,31 @@ class MatchResolutionGui(QMainWindow):
 
         colorbar = self.dz_figure.colorbar(left_im, ax=[ax_left, ax_right], pad=0.02)
         colorbar.set_label("|ΔZ| (ohms)", fontsize=9)
+
+        # Heatmap: min(horizontal, vertical) — best achievable resolution at each point
+        if heatmap_range is not None:
+            heat_vmin, heat_vmax = heatmap_range
+        else:
+            heat_vmin, heat_vmax = good_threshold, poor_threshold
+        heat_norm = Normalize(vmin=heat_vmin, vmax=heat_vmax, clip=True)
+        heat_im = ax_heat.imshow(
+            heatmap_data,
+            aspect="auto",
+            origin="lower",
+            cmap=cmap,
+            norm=heat_norm,
+            interpolation="nearest",
+            extent=[0, len(x_values), 0, len(y_values)],
+        )
+        ax_heat.set_title("Heatmap: min(H, V) |ΔZ|", fontsize=11, fontweight="bold")
+        ax_heat.set_xlabel("C1 Position (0 - 447)", fontsize=9)
+        ax_heat.set_ylabel("C2 Position (0 - 447)", fontsize=9)
+        ax_heat.tick_params(labelsize=8)
+        for boundary in range(64, max(len(x_values), len(y_values)), 64):
+            ax_heat.axvline(boundary, color="white", linewidth=0.35, alpha=0.5)
+            ax_heat.axhline(boundary, color="white", linewidth=0.35, alpha=0.5)
+        heat_cb = self.dz_figure.colorbar(heat_im, ax=ax_heat, pad=0.02)
+        heat_cb.set_label(f"|ΔZ| (ohms)  [{heat_vmin:g} – {heat_vmax:g}]", fontsize=9)
 
         self.dz_figure.suptitle(
             f"Delta impedance resolution map  (green <= {good_threshold:g}, red >= {poor_threshold:g})",

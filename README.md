@@ -5,8 +5,10 @@
 MatchResolution converts RF matching datasets into analysis views and charts:
 - **Display** row table
 - **X-Y Table** for selected S-parameter
+- **Phase Magnitude** table with 0-360° rotation
+- **Contour** edge-only table and Smith view
 - **Impedance**, **dZ**, **Reflect Coefficient**, **Efficiency**
-- **Smith Chart** with search and manual points
+- **Smith Chart** with search, manual points, P/M mode, and image save
 - **Component** plots
 
 During conversion, the app can **de-embed cable effects** using Cable1/Cable2 S-parameters.
@@ -33,6 +35,8 @@ Run:
 ```
 
 The app opens **maximized** by default.
+
+On startup, a splash screen shows the program name, version, and loading progress for a few seconds before the main window appears.
 
 ---
 
@@ -90,14 +94,18 @@ All tabs and plots use these de-embedded S-parameters.
 
 - **Display**: converted row table (de-embedded values).
 - **X-Y Table**: grid view by selected S-parameter.
+- **Phase Magnitude**: magnitude/phase table with a 0-360° rotation control on the Smith Chart tab.
+- **Contour**: edge-only grid view and contour Smith mode.
 - **Impedance**: derived impedance table/plot.
 - **dZ**: delta-impedance maps.
 - **Reflect Coefficient**: delta-Γ analysis.
 - **Efficiency**: `|S21|²` and `ηoverall = (1 - |S11|²) × |S21|²`.
 - **Smith Chart**:
-  - Modes: X-Y Table / dZ / dΓ / Efficiency
+  - Modes: X-Y Table / dZ / dΓ / Efficiency / Contour / P/M
   - **Search ZL** by `C1%` and `C2%`
+  - **Demo** runs `C1% = C2% = 0, 10, ..., 100` with Search ZL → Carry Over → Plot Points
   - **Carry Over** inserts search result into manual points
+  - **Save Image** exports the current Smith chart as PNG
   - Hover text appears below **Parameter**
 - **Component**: capacitor and resolution plots.
 
@@ -106,7 +114,7 @@ All tabs and plots use these de-embedded S-parameters.
 ## 7. Export behavior
 
 **Export CSV** exports data for the currently selected tab:
-- X-Y Table / Impedance / dZ / Reflect Coefficient / Efficiency views export grid-style tables.
+- X-Y Table / Phase Magnitude / Contour / Impedance / dZ / Reflect Coefficient / Efficiency views export grid-style tables.
 - Otherwise, default export uses main converted table.
 
 ---
