@@ -1,5 +1,9 @@
 # Changelog
 
+## V1.0.9
+
+- Smith Chart tab: added an **Import** button next to the Clear button that opens a file explorer for the user to select an impedance data CSV file (`R`, `jX` columns). Imported rows are appended directly into the manual impedance points table, making it easy to batch-plot many impedance points without manual entry.
+
 ## V1.0.8
 
 - Changed application window icon, taskbar icon, and EXE file icon to `smithchart.ico`.
