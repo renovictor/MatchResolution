@@ -2499,6 +2499,9 @@ class MatchResolutionGui(QMainWindow):
         self.manual_clear_button = QPushButton("Clear")
         self.manual_clear_button.clicked.connect(self._clear_manual_impedance_points)
         manual_button_row.addWidget(self.manual_clear_button)
+        self.manual_import_button = QPushButton("Import")
+        self.manual_import_button.clicked.connect(self._import_manual_impedance_csv)
+        manual_button_row.addWidget(self.manual_import_button)
         manual_button_row.addStretch(1)
         manual_layout.addLayout(manual_button_row)
 
@@ -3795,6 +3798,58 @@ class MatchResolutionGui(QMainWindow):
         self.manual_impedance_status_label.setText("Manual impedance points cleared.")
         if _MATPLOTLIB_OK:
             self._draw_smith_chart(self.df_smith_points or [], self.current_smith_parameter)
+
+    def _import_manual_impedance_csv(self):
+        if self.manual_impedance_model is None:
+            return
+
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import Impedance Data",
+            "",
+            "CSV Files (*.csv);;All Files (*)"
+        )
+        if not file_path:
+            return
+
+        try:
+            df = pd.read_csv(file_path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Import Error", f"Failed to read CSV file:\n{exc}")
+            return
+
+        # Normalise column names: key = stripped+lowercased, value = original (for row indexing)
+        col_map = {c.strip().lower(): c for c in df.columns}
+        r_col = col_map.get("r")
+        x_col = col_map.get("jx") or col_map.get("x")
+
+        if r_col is None or x_col is None:
+            QMessageBox.critical(
+                self,
+                "Import Error",
+                "CSV must contain columns 'R' and 'jX' (or 'X').\n"
+                f"Found columns: {list(df.columns)}"
+            )
+            return
+
+        imported = 0
+        skipped = 0
+        for _, row in df.iterrows():
+            r_val = str(row[r_col]).strip()
+            x_val = str(row[x_col]).strip()
+            if not r_val or not x_val:
+                skipped += 1
+                continue
+            if not is_float_text(r_val) or not is_float_text(x_val):
+                skipped += 1
+                continue
+            self.manual_impedance_model.set_next_available_point(float(r_val), float(x_val))
+            imported += 1
+
+        msg = f"Imported {imported} impedance point(s) from CSV."
+        if skipped:
+            msg += f" ({skipped} row(s) skipped due to invalid or empty values.)"
+        self.manual_impedance_status_label.setText(msg)
 
     def _carry_over_search_result(self):
         if self.manual_impedance_model is None:
