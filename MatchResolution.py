@@ -1155,9 +1155,13 @@ def build_efficiency_display_table(df, efficiency_mode):
     s11_x_col = "S11_x"
     s21_r_col = "S21_r"
     s21_x_col = "S21_x"
+    s22_r_col = "S22_r"
+    s22_x_col = "S22_x"
 
     if not all(col in df.columns for col in [s11_r_col, s11_x_col, s21_r_col, s21_x_col]):
         raise ValueError("Missing S11 or S21 columns required for efficiency calculation.")
+
+    has_s22 = all(col in df.columns for col in [s22_r_col, s22_x_col])
 
     x_values, y_values = extract_xy_axis_values(df)
 
@@ -1168,7 +1172,12 @@ def build_efficiency_display_table(df, efficiency_mode):
 
     grid = [["" for _ in x_values] for _ in y_values]
 
-    for row in df[["X_C1", "Y_C2", s11_r_col, s11_x_col, s21_r_col, s21_x_col]].itertuples(index=False):
+    if efficiency_mode == "h_squared" and has_s22:
+        iter_cols = ["X_C1", "Y_C2", s11_r_col, s11_x_col, s21_r_col, s21_x_col, s22_r_col, s22_x_col]
+    else:
+        iter_cols = ["X_C1", "Y_C2", s11_r_col, s11_x_col, s21_r_col, s21_x_col]
+
+    for row in df[iter_cols].itertuples(index=False):
         x_pos = int(row[0])
         y_pos = int(row[1])
         s11_real = row[2]
@@ -1181,7 +1190,22 @@ def build_efficiency_display_table(df, efficiency_mode):
         s21 = complex(s21_real, s21_imag)
         s11_magnitude = abs(s11)
         s21_magnitude = abs(s21)
-        if efficiency_mode == "overall":
+        if efficiency_mode == "h_squared" and has_s22 and len(row) >= 8:
+            s22_real = row[6]
+            s22_imag = row[7]
+            if pd.isna(s22_real) or pd.isna(s22_imag):
+                continue
+            s22 = complex(s22_real, s22_imag)
+            # Γ_L = S22 (ZL derived from S22 → Γ_L = (ZL−Z0)/(ZL+Z0) = S22)
+            gamma_l = s22
+            gamma_l_sq = abs(gamma_l) ** 2          # |Γ_L|²
+            denom = 1.0 - s22 * gamma_l              # 1 − S22²
+            denom_sq = abs(denom) ** 2
+            if denom_sq < 1e-18:
+                continue
+            # G_T = |S21|² × (1 − |Γ_L|²) / |1 − S22·Γ_L|²
+            efficiency = (s21_magnitude ** 2) * (1.0 - gamma_l_sq) / denom_sq
+        elif efficiency_mode == "overall":
             efficiency = (1.0 - (s11_magnitude ** 2)) * (s21_magnitude ** 2)
         elif efficiency_mode == "s21_squared":
             efficiency = s21_magnitude ** 2
@@ -1189,7 +1213,9 @@ def build_efficiency_display_table(df, efficiency_mode):
             raise ValueError(f"Unknown efficiency mode: {efficiency_mode}")
         grid[y_lookup[y_pos]][x_lookup[x_pos]] = f"{efficiency:.4f}"
 
-    if efficiency_mode == "overall":
+    if efficiency_mode == "h_squared":
+        mode_label = "|S21|²·(1−|S22|²) / |1−S22²|²"
+    elif efficiency_mode == "overall":
         mode_label = "ηoverall = (1 - |S11|²) × |S21|²"
     else:
         mode_label = "|S21|²"
@@ -1324,23 +1350,33 @@ def build_smith_dgamma_lookup(df, parameter_name, orientation):
     return dgamma_lookup
 
 
-def build_smith_efficiency_lookup(df):
+def build_smith_efficiency_lookup(df, efficiency_mode="h_squared"):
     """
     Build a lookup table for Smith-chart efficiency coloring.
-    Efficiency = (1 - |S11|²) × |S21|²
+    Supports three modes:
+      'h_squared' : |S21|²·(1−|S22|²) / |1−S22²|²  (default)
+      'overall'   : (1 - |S11|²) × |S21|²
+      's21_squared': |S21|²
     """
-    x_values, y_values = extract_xy_axis_values(df)
-    
     s11_r_col = "S11_r"
     s11_x_col = "S11_x"
     s21_r_col = "S21_r"
     s21_x_col = "S21_x"
+    s22_r_col = "S22_r"
+    s22_x_col = "S22_x"
 
     if not all(col in df.columns for col in [s11_r_col, s11_x_col, s21_r_col, s21_x_col]):
         return {}
 
+    has_s22 = all(col in df.columns for col in [s22_r_col, s22_x_col])
+
+    if efficiency_mode == "h_squared" and has_s22:
+        iter_cols = ["X_C1", "Y_C2", s11_r_col, s11_x_col, s21_r_col, s21_x_col, s22_r_col, s22_x_col]
+    else:
+        iter_cols = ["X_C1", "Y_C2", s11_r_col, s11_x_col, s21_r_col, s21_x_col]
+
     efficiency_lookup = {}
-    for row in df[["X_C1", "Y_C2", s11_r_col, s11_x_col, s21_r_col, s21_x_col]].itertuples(index=False):
+    for row in df[iter_cols].itertuples(index=False):
         x_pos = int(row[0])
         y_pos = int(row[1])
         s11_real = row[2]
@@ -1353,7 +1389,25 @@ def build_smith_efficiency_lookup(df):
         s21 = complex(s21_real, s21_imag)
         s11_magnitude = abs(s11)
         s21_magnitude = abs(s21)
-        efficiency = (1.0 - (s11_magnitude ** 2)) * (s21_magnitude ** 2)
+        if efficiency_mode == "h_squared" and has_s22 and len(row) >= 8:
+            s22_real = row[6]
+            s22_imag = row[7]
+            if pd.isna(s22_real) or pd.isna(s22_imag):
+                continue
+            s22 = complex(s22_real, s22_imag)
+            # Γ_L = S22 (ZL derived from S22 → Γ_L = (ZL−Z0)/(ZL+Z0) = S22)
+            gamma_l = s22
+            gamma_l_sq = abs(gamma_l) ** 2
+            denom = 1.0 - s22 * gamma_l              # 1 − S22²
+            denom_sq = abs(denom) ** 2
+            if denom_sq < 1e-18:
+                continue
+            # G_T = |S21|² × (1 − |Γ_L|²) / |1 − S22·Γ_L|²
+            efficiency = (s21_magnitude ** 2) * (1.0 - gamma_l_sq) / denom_sq
+        elif efficiency_mode == "overall":
+            efficiency = (1.0 - (s11_magnitude ** 2)) * (s21_magnitude ** 2)
+        else:
+            efficiency = s21_magnitude ** 2
         efficiency_lookup[(x_pos, y_pos)] = float(efficiency)
 
     return efficiency_lookup
@@ -1732,7 +1786,7 @@ class MatchResolutionGui(QMainWindow):
         self.current_reflection_parameter = "S22"
         self.current_reflection_mode = "horizontal"
         self.df_efficiency_display = None
-        self.current_efficiency_mode = "s21_squared"
+        self.current_efficiency_mode = "h_squared"
         self.smith_manual_points = []
         self.smith_search_result = None
         self.manual_impedance_model = None
@@ -1746,7 +1800,7 @@ class MatchResolutionGui(QMainWindow):
         self.smith_dz_lookup = {}
         self.smith_dgamma_lookup = {}
         self.smith_efficiency_lookup = {}
-        self.efficiency_good_threshold = 0.5
+        self.efficiency_good_threshold = 1.0
         self.efficiency_poor_threshold = 0.1
         self.current_cable_source = "default (no cable)"
 
@@ -2764,6 +2818,7 @@ class MatchResolutionGui(QMainWindow):
 
         efficiency_toolbar_layout.addWidget(QLabel("Formula:"))
         self.efficiency_mode_combo = QComboBox()
+        self.efficiency_mode_combo.addItem("|S21|²·(1−|S22|²) / |1−S22²|²", "h_squared")
         self.efficiency_mode_combo.addItem("|S21|²", "s21_squared")
         self.efficiency_mode_combo.addItem("ηoverall = (1 - |S11|²) × |S21|²", "overall")
         self.efficiency_mode_combo.setCurrentIndex(0)
@@ -2816,7 +2871,7 @@ class MatchResolutionGui(QMainWindow):
 
         efficiency_plot_controls = QHBoxLayout()
         efficiency_plot_controls.addWidget(QLabel("Good η ≥"))
-        self.efficiency_good_edit = QLineEdit("50")
+        self.efficiency_good_edit = QLineEdit("100")
         self.efficiency_good_edit.setFixedWidth(80)
         self.efficiency_good_edit.setValidator(QDoubleValidator(0.0, 100.0, 1))
         self.efficiency_good_edit.editingFinished.connect(self._on_efficiency_threshold_changed)
@@ -2854,7 +2909,7 @@ class MatchResolutionGui(QMainWindow):
         main_layout.addWidget(self.tabs, stretch=1)
 
         note = QLabel(
-            "Note: Display tab shows the converted row table. X-Y Table shows the grid view for the selected S-parameter. dZ shows delta impedance for S22. Reflect Coefficient tab shows delta-Γ resolution from X-Y data. Efficiency tab lets you switch between |S21|² and ηoverall = (1 - |S11|²) × |S21|². Smith Chart supports X-Y Table, dZ, dΓ, Efficiency coloring modes, manual R/X points, ZL search by C1/C2, and one-click demo plotting."
+            "Note: Display tab shows the converted row table. X-Y Table shows the grid view for the selected S-parameter. dZ shows delta impedance for S22. Reflect Coefficient tab shows delta-Γ resolution from X-Y data. Efficiency tab lets you switch between |S21|²·(1−|S22|²)/|1−S22²|² (default), |S21|², and ηoverall = (1 - |S11|²) × |S21|². Smith Chart supports X-Y Table, dZ, dΓ, Efficiency coloring modes, manual R/X points, ZL search by C1/C2, and one-click demo plotting."
         )
         note.setAlignment(Qt.AlignCenter)
         note.setStyleSheet("font-size: 13px; color: #607D8B; padding: 6px;")
@@ -2980,7 +3035,7 @@ class MatchResolutionGui(QMainWindow):
 
         # Row 0: Frequency
         form_grid.addWidget(_lbl("Frequency"), 0, 0)
-        self.comp_freq_edit = _edit("13.56")
+        self.comp_freq_edit = _edit("27.12")
         form_grid.addWidget(self.comp_freq_edit, 0, 1)
         form_grid.addWidget(_lbl("MHz"), 0, 2)
 
@@ -3000,20 +3055,23 @@ class MatchResolutionGui(QMainWindow):
         form_grid.setColumnMinimumWidth(3, 30)
 
         # Rows 3-9: parameter rows
-        row_labels = ["Coarse 1 to 6", "Fine 6", "Fine 5", "Fine 4", "Fine 3", "Fine 2", "Fine 1"]
+        # Order: [0]=Coarse, [1]=Fine6, [2]=Fine5, [3]=Fine4, [4]=Fine3, [5]=Fine2, [6]=Fine1
+        row_labels   = ["Coarse 1 to 6", "Fine 6", "Fine 5", "Fine 4", "Fine 3", "Fine 2", "Fine 1"]
+        c1_defaults  = ["75",  "43",  "34",  "15",  "0.1", "4.7", "2.2"]
+        c2_defaults  = ["75",  "75",  "43",  "21",  "15",  "0.1", "4.7"]
         self.c1_edits = []
         self.c2_edits = []
         for idx, lbl_text in enumerate(row_labels):
             r = 3 + idx
             # C1
             form_grid.addWidget(_lbl(lbl_text), r, 0)
-            e1 = _edit()
+            e1 = _edit(c1_defaults[idx])
             form_grid.addWidget(e1, r, 1)
             form_grid.addWidget(_lbl("pF"), r, 2)
             self.c1_edits.append(e1)
             # C2
             form_grid.addWidget(_lbl(lbl_text), r, 4)
-            e2 = _edit()
+            e2 = _edit(c2_defaults[idx])
             form_grid.addWidget(e2, r, 5)
             form_grid.addWidget(_lbl("pF"), r, 6)
             self.c2_edits.append(e2)
@@ -3469,6 +3527,11 @@ class MatchResolutionGui(QMainWindow):
         self.current_efficiency_mode = self.efficiency_mode_combo.currentData()
         self.df_efficiency_display = build_efficiency_display_table(self.df_all, self.current_efficiency_mode)
 
+        # Rebuild Smith chart efficiency lookup to match the current formula
+        self.smith_efficiency_lookup = build_smith_efficiency_lookup(self.df_all, self.current_efficiency_mode)
+        if self.current_smith_mode == "efficiency":
+            self._draw_smith_chart(self.smith_plot_points, self.current_smith_parameter)
+
         self.efficiency_table_model = PandasTableModel(self.df_efficiency_display)
         self.efficiency_table_view.setModel(self.efficiency_table_model)
         self.efficiency_table_view.horizontalHeader().setVisible(False)
@@ -3510,7 +3573,7 @@ class MatchResolutionGui(QMainWindow):
 
     def _get_efficiency_thresholds(self, show_message=False):
         try:
-            good_threshold = float(self.efficiency_good_edit.text().strip() or "50") / 100.0
+            good_threshold = float(self.efficiency_good_edit.text().strip() or "100") / 100.0
             poor_threshold = float(self.efficiency_poor_edit.text().strip() or "10") / 100.0
         except ValueError:
             if show_message:
@@ -3724,7 +3787,7 @@ class MatchResolutionGui(QMainWindow):
                 )
             else:
                 self.smith_dgamma_lookup = {}
-            self.smith_efficiency_lookup = build_smith_efficiency_lookup(self.df_all)
+            self.smith_efficiency_lookup = build_smith_efficiency_lookup(self.df_all, self.current_efficiency_mode)
 
         if self.current_smith_mode == "contour":
             contour_count = max(len(self.df_smith_points) - 1, 0)

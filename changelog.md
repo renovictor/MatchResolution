@@ -1,6 +1,12 @@
 # Changelog
 
-## V1.0.9
+## V2.0.0
+
+- **Efficiency formula correction:** replaced the incorrect `|S21/(1−S22²)|²` formula with the correct transducer gain formula `G_T = |S21|²·(1−|S22|²) / |1−S22²|²` (where Γ_L = S22 at each grid point), ensuring η never exceeds 100%.
+- **New default efficiency formula:** added `|S21|²·(1−|S22|²) / |1−S22²|²` as the new default formula in the Efficiency tab combo box. The original `|S21|²` and `ηoverall = (1−|S11|²)×|S21|²` formulas are retained as options.
+- **Smith Chart efficiency sync:** Smith Chart efficiency coloring now uses the same formula selected in the Efficiency tab and refreshes automatically when the formula is changed.
+- **Good η default changed to 100%:** the default "Good η ≥" threshold in the Efficiency tab is now 100% (was 50%).
+- **Component Analysis defaults:** pre-filled Component Analysis tab with standard values — Frequency 27.12 MHz; C1: Coarse=75, Fine6=43, Fine5=34, Fine4=15, Fine3=0.1, Fine2=4.7, Fine1=2.2 pF; C2: Coarse=75, Fine6=75, Fine5=43, Fine4=21, Fine3=15, Fine2=0.1, Fine1=4.7 pF.
 
 - Smith Chart tab: added an **Import** button next to the Clear button that opens a file explorer for the user to select an impedance data CSV file (`R`, `jX` columns). Imported rows are appended directly into the manual impedance points table, making it easy to batch-plot many impedance points without manual entry.
 
