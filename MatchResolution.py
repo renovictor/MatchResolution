@@ -4,7 +4,7 @@ import os
 import re
 import sys
 
-from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QEventLoop, QElapsedTimer, QTimer
+from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QEvent, QEventLoop, QElapsedTimer, QTimer
 from PySide6.QtGui import QColor, QBrush, QFont, QDoubleValidator, QIcon
 from PySide6.QtWidgets import (
     QApplication,
@@ -44,6 +44,7 @@ FULL_GRID_ROWS = 7 * 64 * 7 * 64
 REDUCED_GRID_ROWS = 7 * 8 * 7 * 8
 XY_PARAMETERS = ["S11", "S21", "S12", "S22"]
 IMPEDANCE_PARAMETERS = ["S11", "S22"]
+ZPAR_PARAMETERS = ["Z11", "Z21", "Z12", "Z22"]
 DEFAULT_Z0 = 50.0
 CABLE_REQUIRED_COLUMNS = ["cable", "s11r", "s11x", "s21r", "s21x", "s12r", "s12x", "s22r", "s22x"]
 DEFAULT_CABLE_S_PARAMETERS = {
@@ -280,7 +281,7 @@ def _t_matrix_to_s_parameters(t_matrix: np.ndarray, context: str):
 
     s11 = a12 / a22
     s21 = 1.0 / a22
-    s12 = -((a11 * a22) - (a12 * a21)) / a22
+    s12 = ((a11 * a22) - (a12 * a21)) / a22
     s22 = -a21 / a22
     return s11, s21, s12, s22
 
@@ -699,6 +700,79 @@ def build_xy_display_table(df, parameter_name):
     presentation_rows = []
     presentation_rows.append(["", "", "c1 coarse"] + [str(x // 64) for x in x_values])
     presentation_rows.append(["", parameter_name, "c1 fine"] + [str(x % 64) for x in x_values])
+    presentation_rows.append(["C2 coarse", "c2 fine", "percentage"] + [f"{(x / x_denominator) * 100:.2f}%" for x in x_values])
+
+    for y_index, y_value in enumerate(y_values):
+        presentation_rows.append(
+            [
+                str(y_value // 64),
+                str(y_value % 64),
+                f"{(y_value / y_denominator) * 100:.2f}%",
+                *grid[y_index],
+            ]
+        )
+
+    return pd.DataFrame(presentation_rows)
+
+
+def s_to_z_parameter_values(s11, s21, s12, s22, z0=DEFAULT_Z0):
+    """Convert a 2-port S matrix to Z-parameters for one grid point."""
+    if any(pd.isna(value) for value in [s11, s21, s12, s22]):
+        return None
+
+    denom = (1.0 - s11) * (1.0 - s22) - (s12 * s21)
+    if abs(denom) < 1e-12:
+        return None
+
+    z11 = z0 * (((1.0 + s11) * (1.0 - s22)) + (s12 * s21)) / denom
+    z12 = z0 * (2.0 * s12) / denom
+    z21 = z0 * (2.0 * s21) / denom
+    z22 = z0 * (((1.0 - s11) * (1.0 + s22)) + (s12 * s21)) / denom
+    return {
+        "Z11": z11,
+        "Z12": z12,
+        "Z21": z21,
+        "Z22": z22,
+    }
+
+
+def build_zpar_display_table(df, parameter_name):
+    """
+    Build a spreadsheet-like X-Y table showing Z-parameters derived from the S matrix.
+    """
+    if parameter_name not in ZPAR_PARAMETERS:
+        raise ValueError(f"Unknown Z parameter: {parameter_name}")
+
+    required_columns = ["S11_r", "S11_x", "S21_r", "S21_x", "S12_r", "S12_x", "S22_r", "S22_x"]
+    if not all(column in df.columns for column in required_columns):
+        raise ValueError("Missing S-parameter columns required for Z-parameter conversion.")
+
+    x_values, y_values = extract_xy_axis_values(df)
+    x_lookup = {value: index for index, value in enumerate(x_values)}
+    y_lookup = {value: index for index, value in enumerate(y_values)}
+    x_denominator = max(x_values) if max(x_values) > 0 else 1
+    y_denominator = max(y_values) if max(y_values) > 0 else 1
+
+    grid = [["" for _ in x_values] for _ in y_values]
+
+    for row in df[["X_C1", "Y_C2", "S11_r", "S11_x", "S21_r", "S21_x", "S12_r", "S12_x", "S22_r", "S22_x"]].itertuples(index=False):
+        x_pos = int(row[0])
+        y_pos = int(row[1])
+        s11 = complex(row[2], row[3])
+        s21 = complex(row[4], row[5])
+        s12 = complex(row[6], row[7])
+        s22 = complex(row[8], row[9])
+
+        z_values = s_to_z_parameter_values(s11, s21, s12, s22)
+        if z_values is None:
+            continue
+
+        z_value = z_values[parameter_name]
+        grid[y_lookup[y_pos]][x_lookup[x_pos]] = format_complex_text(z_value.real, z_value.imag)
+
+    presentation_rows = []
+    presentation_rows.append(["", "", "c1 coarse"] + [str(x // 64) for x in x_values])
+    presentation_rows.append(["", f"Zpar({parameter_name})", "c1 fine"] + [str(x % 64) for x in x_values])
     presentation_rows.append(["C2 coarse", "c2 fine", "percentage"] + [f"{(x / x_denominator) * 100:.2f}%" for x in x_values])
 
     for y_index, y_value in enumerate(y_values):
@@ -1780,6 +1854,8 @@ class MatchResolutionGui(QMainWindow):
         self.current_contour_parameter = "S22"
         self.df_impedance_display = None
         self.current_impedance_parameter = "S22"
+        self.df_zpar_display = None
+        self.current_zpar_parameter = "Z22"
         self.df_dz_display = None
         self.current_dz_parameter = "S22 horizontal"
         self.df_reflection_display = None
@@ -2264,6 +2340,57 @@ class MatchResolutionGui(QMainWindow):
         """)
         self.impedance_tab = self.create_table_page(self.impedance_table_view, impedance_toolbar)
         self.tabs.addTab(self.impedance_tab, "Impedance")
+
+        zpar_toolbar = QFrame()
+        zpar_toolbar.setStyleSheet("""
+            QFrame {
+                background-color: #ECEFF1;
+                border-radius: 10px;
+                padding: 8px;
+            }
+        """)
+        zpar_toolbar_layout = QHBoxLayout(zpar_toolbar)
+
+        zpar_toolbar_layout.addWidget(QLabel("Parameter:"))
+        self.zpar_parameter_combo = QComboBox()
+        self.zpar_parameter_combo.addItems(ZPAR_PARAMETERS)
+        self.zpar_parameter_combo.setCurrentText("Z22")
+        self.zpar_parameter_combo.currentTextChanged.connect(self.refresh_zpar_table)
+        zpar_toolbar_layout.addWidget(self.zpar_parameter_combo)
+
+        zpar_toolbar_layout.addWidget(QLabel("S-parameters are converted to Z-parameters for later efficiency work."))
+        self.zpar_cell_label = QLabel("Click a cell to see the value here.")
+        self.zpar_cell_label.setStyleSheet("""
+            QLabel {
+                color: #37474F;
+                background-color: #ECEFF1;
+                border: 1px solid #90A4AE;
+                border-radius: 8px;
+                padding: 6px 10px;
+                font-weight: bold;
+            }
+        """)
+        zpar_toolbar_layout.addWidget(self.zpar_cell_label, stretch=1)
+        zpar_toolbar_layout.addStretch(1)
+
+        self.zpar_table_view = QTableView()
+        self.zpar_table_view.setAlternatingRowColors(False)
+        self.zpar_table_view.setStyleSheet("""
+            QTableView {
+                background-color: white;
+                gridline-color: #90A4AE;
+                font-size: 12px;
+            }
+            QHeaderView::section {
+                background-color: #546E7A;
+                color: white;
+                padding: 4px;
+                border: 1px solid #78909C;
+                font-weight: bold;
+            }
+        """)
+        self.zpar_table_page = self.create_table_page(self.zpar_table_view, zpar_toolbar)
+        self.tabs.addTab(self.zpar_table_page, "Zpar")
 
         dz_toolbar = QFrame()
         dz_toolbar.setStyleSheet("""
@@ -2909,7 +3036,7 @@ class MatchResolutionGui(QMainWindow):
         main_layout.addWidget(self.tabs, stretch=1)
 
         note = QLabel(
-            "Note: Display tab shows the converted row table. X-Y Table shows the grid view for the selected S-parameter. dZ shows delta impedance for S22. Reflect Coefficient tab shows delta-Γ resolution from X-Y data. Efficiency tab lets you switch between |S21|²·(1−|S22|²)/|1−S22²|² (default), |S21|², and ηoverall = (1 - |S11|²) × |S21|². Smith Chart supports X-Y Table, dZ, dΓ, Efficiency coloring modes, manual R/X points, ZL search by C1/C2, and one-click demo plotting."
+            "Note: Display tab shows the converted row table. X-Y Table shows the grid view for the selected S-parameter. Zpar shows the converted Z-parameters. dZ shows delta impedance for S22. Reflect Coefficient tab shows delta-Γ resolution from X-Y data. Efficiency tab lets you switch between |S21|²·(1−|S22|²)/|1−S22²|² (default), |S21|², and ηoverall = (1 - |S11|²) × |S21|². Smith Chart supports X-Y Table, dZ, dΓ, Efficiency coloring modes, manual R/X points, ZL search by C1/C2, and one-click demo plotting."
         )
         note.setAlignment(Qt.AlignCenter)
         note.setStyleSheet("font-size: 13px; color: #607D8B; padding: 6px;")
@@ -3264,6 +3391,151 @@ class MatchResolutionGui(QMainWindow):
         layout.addWidget(table_view, stretch=1)
         return page
 
+    def _create_frozen_overlay_view(self, parent_view: QTableView) -> QTableView:
+        overlay_view = QTableView(parent_view)
+        overlay_view.setAlternatingRowColors(False)
+        overlay_view.setStyleSheet(parent_view.styleSheet())
+        overlay_view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        overlay_view.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        overlay_view.setFocusPolicy(Qt.NoFocus)
+        overlay_view.setFrameShape(QFrame.NoFrame)
+        overlay_view.horizontalHeader().setVisible(False)
+        overlay_view.verticalHeader().setVisible(False)
+        overlay_view.horizontalHeader().setSectionResizeMode(QHeaderView.Fixed)
+        overlay_view.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
+        overlay_view.setSelectionBehavior(QTableView.SelectItems)
+        overlay_view.setSelectionMode(QTableView.SingleSelection)
+        return overlay_view
+
+    def _update_frozen_pane_geometry(self, table_view: QTableView):
+        pane = getattr(self, "_freeze_panes", {}).get(table_view)
+        if pane is None:
+            return
+
+        model = table_view.model()
+        if model is None:
+            table_view.setViewportMargins(0, 0, 0, 0)
+            pane["corner"].hide()
+            pane["top"].hide()
+            pane["left"].hide()
+            return
+
+        freeze_rows = min(pane["freeze_rows"], model.rowCount())
+        freeze_cols = min(pane["freeze_cols"], model.columnCount())
+        if freeze_rows <= 0 or freeze_cols <= 0:
+            table_view.setViewportMargins(0, 0, 0, 0)
+            pane["corner"].hide()
+            pane["top"].hide()
+            pane["left"].hide()
+            return
+
+        frozen_width = sum(table_view.columnWidth(col) for col in range(freeze_cols))
+        frozen_height = sum(table_view.rowHeight(row) for row in range(freeze_rows))
+        table_view.setViewportMargins(frozen_width, frozen_height, 0, 0)
+
+        frame = table_view.frameWidth()
+        viewport_width = table_view.viewport().width()
+        viewport_height = table_view.viewport().height()
+
+        pane["corner"].setGeometry(frame, frame, frozen_width, frozen_height)
+        pane["top"].setGeometry(frame + frozen_width, frame, max(0, viewport_width), frozen_height)
+        pane["left"].setGeometry(frame, frame + frozen_height, frozen_width, max(0, viewport_height))
+
+        pane["corner"].show()
+        pane["top"].show()
+        pane["left"].show()
+
+    def _sync_frozen_pane_sections(self, table_view: QTableView):
+        pane = getattr(self, "_freeze_panes", {}).get(table_view)
+        if pane is None:
+            return
+        model = table_view.model()
+        if model is None:
+            return
+
+        for col in range(model.columnCount()):
+            width = table_view.columnWidth(col)
+            pane["corner"].setColumnWidth(col, width)
+            pane["top"].setColumnWidth(col, width)
+            pane["left"].setColumnWidth(col, width)
+
+        for row in range(model.rowCount()):
+            height = table_view.rowHeight(row)
+            pane["corner"].setRowHeight(row, height)
+            pane["top"].setRowHeight(row, height)
+            pane["left"].setRowHeight(row, height)
+
+    def _apply_freeze_panes(self, table_view: QTableView, freeze_rows: int = 3, freeze_cols: int = 3):
+        if not hasattr(self, "_freeze_panes"):
+            self._freeze_panes = {}
+
+        pane = self._freeze_panes.get(table_view)
+        if pane is None:
+            corner = self._create_frozen_overlay_view(table_view)
+            top = self._create_frozen_overlay_view(table_view)
+            left = self._create_frozen_overlay_view(table_view)
+            pane = {
+                "corner": corner,
+                "top": top,
+                "left": left,
+                "freeze_rows": freeze_rows,
+                "freeze_cols": freeze_cols,
+            }
+            self._freeze_panes[table_view] = pane
+
+            table_view.installEventFilter(self)
+            table_view.horizontalScrollBar().valueChanged.connect(top.horizontalScrollBar().setValue)
+            top.horizontalScrollBar().valueChanged.connect(table_view.horizontalScrollBar().setValue)
+            table_view.verticalScrollBar().valueChanged.connect(left.verticalScrollBar().setValue)
+            left.verticalScrollBar().valueChanged.connect(table_view.verticalScrollBar().setValue)
+            table_view.horizontalHeader().sectionResized.connect(
+                lambda *_args, tv=table_view: (self._sync_frozen_pane_sections(tv), self._update_frozen_pane_geometry(tv))
+            )
+            table_view.verticalHeader().sectionResized.connect(
+                lambda *_args, tv=table_view: (self._sync_frozen_pane_sections(tv), self._update_frozen_pane_geometry(tv))
+            )
+
+        pane["freeze_rows"] = freeze_rows
+        pane["freeze_cols"] = freeze_cols
+
+        model = table_view.model()
+        if model is None:
+            self._update_frozen_pane_geometry(table_view)
+            return
+
+        selection_model = table_view.selectionModel()
+        for overlay in (pane["corner"], pane["top"], pane["left"]):
+            overlay.setModel(model)
+            if selection_model is not None:
+                overlay.setSelectionModel(selection_model)
+
+        row_count = model.rowCount()
+        col_count = model.columnCount()
+        frozen_rows = min(freeze_rows, row_count)
+        frozen_cols = min(freeze_cols, col_count)
+
+        for row in range(row_count):
+            is_frozen_row = row < frozen_rows
+            pane["corner"].setRowHidden(row, not is_frozen_row)
+            pane["top"].setRowHidden(row, not is_frozen_row)
+            pane["left"].setRowHidden(row, is_frozen_row)
+
+        for col in range(col_count):
+            is_frozen_col = col < frozen_cols
+            pane["corner"].setColumnHidden(col, not is_frozen_col)
+            pane["top"].setColumnHidden(col, is_frozen_col)
+            pane["left"].setColumnHidden(col, not is_frozen_col)
+
+        self._sync_frozen_pane_sections(table_view)
+        self._update_frozen_pane_geometry(table_view)
+
+    def eventFilter(self, watched, event):
+        freeze_panes = getattr(self, "_freeze_panes", {})
+        if watched in freeze_panes and event.type() in (QEvent.Resize, QEvent.Show, QEvent.LayoutRequest):
+            self._sync_frozen_pane_sections(watched)
+            self._update_frozen_pane_geometry(watched)
+        return super().eventFilter(watched, event)
+
     def refresh_display_table(self):
         if self.df_display is None:
             return
@@ -3293,6 +3565,7 @@ class MatchResolutionGui(QMainWindow):
         if selection_model is not None:
             selection_model.currentChanged.connect(self.update_xy_cell_label)
         self.xy_cell_label.setText("Click a cell to see the value here.")
+        self._apply_freeze_panes(self.xy_table_view, freeze_rows=3, freeze_cols=3)
 
     def update_xy_cell_label(self, current, previous):
         if not current.isValid() or self.df_xy_display is None:
@@ -3336,6 +3609,7 @@ class MatchResolutionGui(QMainWindow):
         if selection_model is not None:
             selection_model.currentChanged.connect(self.update_phase_cell_label)
         self.phase_cell_label.setText("Click a cell to see the value here.")
+        self._apply_freeze_panes(self.phase_table_view, freeze_rows=3, freeze_cols=3)
 
     def update_phase_cell_label(self, current, previous):
         if not current.isValid() or self.df_phase_display is None:
@@ -3379,6 +3653,7 @@ class MatchResolutionGui(QMainWindow):
         if selection_model is not None:
             selection_model.currentChanged.connect(self.update_contour_cell_label)
         self.contour_cell_label.setText("Click a cell to see the value here.")
+        self._apply_freeze_panes(self.contour_table_view, freeze_rows=3, freeze_cols=3)
 
     def update_contour_cell_label(self, current, previous):
         if not current.isValid() or self.df_contour_display is None:
@@ -3455,6 +3730,46 @@ class MatchResolutionGui(QMainWindow):
         if selection_model is not None:
             selection_model.currentChanged.connect(self.update_impedance_cell_label)
         self.impedance_cell_label.setText("Click a cell to see the value here.")
+        self._apply_freeze_panes(self.impedance_table_view, freeze_rows=3, freeze_cols=3)
+
+    def refresh_zpar_table(self):
+        if self.df_all is None or self.df_all.empty:
+            return
+
+        self.current_zpar_parameter = self.zpar_parameter_combo.currentText().strip()
+        self.df_zpar_display = build_zpar_display_table(self.df_all, self.current_zpar_parameter)
+
+        self.zpar_table_model = PandasTableModel(self.df_zpar_display)
+        self.zpar_table_view.setModel(self.zpar_table_model)
+        self.zpar_table_view.horizontalHeader().setVisible(False)
+        self.zpar_table_view.verticalHeader().setVisible(False)
+        self.zpar_table_view.horizontalHeader().setSectionResizeMode(QHeaderView.Fixed)
+        self.zpar_table_view.horizontalHeader().setDefaultSectionSize(80)
+        self.zpar_table_view.verticalHeader().setDefaultSectionSize(24)
+        self.zpar_table_view.setSelectionBehavior(QTableView.SelectItems)
+        self.zpar_table_view.setSelectionMode(QTableView.SingleSelection)
+        selection_model = self.zpar_table_view.selectionModel()
+        if selection_model is not None:
+            selection_model.currentChanged.connect(self.update_zpar_cell_label)
+        self.zpar_cell_label.setText("Click a cell to see the value here.")
+        self._apply_freeze_panes(self.zpar_table_view, freeze_rows=3, freeze_cols=3)
+
+    def update_zpar_cell_label(self, current, previous):
+        if not current.isValid() or self.df_zpar_display is None:
+            self.zpar_cell_label.setText("Click a cell to see the value here.")
+            return
+
+        row = current.row()
+        column = current.column()
+        if row >= len(self.df_zpar_display.index) or column >= len(self.df_zpar_display.columns):
+            self.zpar_cell_label.setText("Click a cell to see the value here.")
+            return
+
+        value = self.df_zpar_display.iat[row, column]
+        if value == "":
+            self.zpar_cell_label.setText(f"Row {row + 1}, Col {column + 1}: empty")
+        else:
+            self.zpar_cell_label.setText(f"Row {row + 1}, Col {column + 1}: {value}")
 
     def update_impedance_cell_label(self, current, previous):
         if not current.isValid() or self.df_impedance_display is None:
@@ -3498,6 +3813,7 @@ class MatchResolutionGui(QMainWindow):
         if selection_model is not None:
             selection_model.currentChanged.connect(self.update_reflection_cell_label)
         self.reflection_cell_label.setText("Click a cell to see the value here.")
+        self._apply_freeze_panes(self.reflection_table_view, freeze_rows=3, freeze_cols=3)
         if _MATPLOTLIB_OK:
             self.plot_reflection_resolution(show_message_on_error=False)
         if self.current_smith_mode == "dgamma" and self.df_all is not None and not self.df_all.empty:
@@ -3545,6 +3861,7 @@ class MatchResolutionGui(QMainWindow):
         if selection_model is not None:
             selection_model.currentChanged.connect(self.update_efficiency_cell_label)
         self.efficiency_cell_label.setText("Click a cell to see the value here.")
+        self._apply_freeze_panes(self.efficiency_table_view, freeze_rows=3, freeze_cols=3)
 
     def update_efficiency_cell_label(self, current, previous):
         if not current.isValid() or self.df_efficiency_display is None:
@@ -4587,6 +4904,7 @@ class MatchResolutionGui(QMainWindow):
             self.refresh_phase_table()
             self.refresh_contour_table()
             self.refresh_impedance_table()
+            self.refresh_zpar_table()
             self.refresh_dz_table()
             self.refresh_reflection_table()
             self.refresh_efficiency_table()
@@ -4632,6 +4950,7 @@ class MatchResolutionGui(QMainWindow):
                 f"Reflect Coefficient tab uses {self.current_reflection_parameter} {self.current_reflection_mode}.\n"
                 f"Efficiency tab uses {self.efficiency_mode_combo.currentText()}.\n"
                 f"Contour tab uses {self.current_contour_parameter}.\n"
+                f"Zpar tab uses {self.current_zpar_parameter}.\n"
                 f"Smith Chart uses {self.current_smith_parameter}."
             )
 
@@ -4650,6 +4969,8 @@ class MatchResolutionGui(QMainWindow):
 
         if current_tab == "Impedance" and self.df_impedance_display is not None:
             default_name = base_name + f"_{self.current_impedance_parameter.lower()}_impedance_table.csv"
+        elif current_tab == "Zpar" and self.df_zpar_display is not None:
+            default_name = base_name + f"_{self.current_zpar_parameter.lower()}_zpar_table.csv"
         elif current_tab == "dZ" and self.df_dz_display is not None:
             default_name = base_name + f"_{self.current_dz_parameter.lower().replace(' ', '_')}_dz_table.csv"
         elif current_tab == "Reflect Coefficient" and self.df_reflection_display is not None:
@@ -4669,7 +4990,7 @@ class MatchResolutionGui(QMainWindow):
 
         save_path, _ = QFileDialog.getSaveFileName(
             self,
-            "Export X-Y Table",
+            f"Export {current_tab} Table",
             default_name,
             "CSV Files (*.csv);;All Files (*)"
         )
