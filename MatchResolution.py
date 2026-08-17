@@ -45,6 +45,7 @@ REDUCED_GRID_ROWS = 7 * 8 * 7 * 8
 XY_PARAMETERS = ["S11", "S21", "S12", "S22"]
 IMPEDANCE_PARAMETERS = ["S11", "S22"]
 ZPAR_PARAMETERS = ["Z11", "Z21", "Z12", "Z22"]
+ABCD_PARAMETERS = ["A", "B", "C", "D"]
 DEFAULT_Z0 = 50.0
 CABLE_REQUIRED_COLUMNS = ["cable", "s11r", "s11x", "s21r", "s21x", "s12r", "s12x", "s22r", "s22x"]
 DEFAULT_CABLE_S_PARAMETERS = {
@@ -788,6 +789,84 @@ def build_zpar_display_table(df, parameter_name):
     return pd.DataFrame(presentation_rows)
 
 
+def z_to_abcd_parameter_values(z11, z12, z21, z22):
+    """Convert a 2-port Z matrix to ABCD parameters for one grid point."""
+    if any(pd.isna(value) for value in [z11, z12, z21, z22]):
+        return None
+
+    if abs(z21) < 1e-12:
+        return None
+
+    determinant = (z11 * z22) - (z12 * z21)
+    return {
+        "A": z11 / z21,
+        "B": determinant / z21,
+        "C": 1.0 / z21,
+        "D": z22 / z21,
+    }
+
+
+def build_abcd_display_table(df, parameter_name):
+    """
+    Build a spreadsheet-like X-Y table showing ABCD matrix terms derived from Z-parameters.
+    """
+    if parameter_name not in ABCD_PARAMETERS:
+        raise ValueError(f"Unknown ABCD parameter: {parameter_name}")
+
+    required_columns = ["S11_r", "S11_x", "S21_r", "S21_x", "S12_r", "S12_x", "S22_r", "S22_x"]
+    if not all(column in df.columns for column in required_columns):
+        raise ValueError("Missing S-parameter columns required for ABCD conversion.")
+
+    x_values, y_values = extract_xy_axis_values(df)
+    x_lookup = {value: index for index, value in enumerate(x_values)}
+    y_lookup = {value: index for index, value in enumerate(y_values)}
+    x_denominator = max(x_values) if max(x_values) > 0 else 1
+    y_denominator = max(y_values) if max(y_values) > 0 else 1
+
+    grid = [["" for _ in x_values] for _ in y_values]
+
+    for row in df[["X_C1", "Y_C2", "S11_r", "S11_x", "S21_r", "S21_x", "S12_r", "S12_x", "S22_r", "S22_x"]].itertuples(index=False):
+        x_pos = int(row[0])
+        y_pos = int(row[1])
+        s11 = complex(row[2], row[3])
+        s21 = complex(row[4], row[5])
+        s12 = complex(row[6], row[7])
+        s22 = complex(row[8], row[9])
+
+        z_values = s_to_z_parameter_values(s11, s21, s12, s22)
+        if z_values is None:
+            continue
+
+        abcd_values = z_to_abcd_parameter_values(
+            z_values["Z11"],
+            z_values["Z12"],
+            z_values["Z21"],
+            z_values["Z22"],
+        )
+        if abcd_values is None:
+            continue
+
+        abcd_value = abcd_values[parameter_name]
+        grid[y_lookup[y_pos]][x_lookup[x_pos]] = format_complex_text(abcd_value.real, abcd_value.imag)
+
+    presentation_rows = []
+    presentation_rows.append(["", "", "c1 coarse"] + [str(x // 64) for x in x_values])
+    presentation_rows.append(["", f"ABCD({parameter_name})", "c1 fine"] + [str(x % 64) for x in x_values])
+    presentation_rows.append(["C2 coarse", "c2 fine", "percentage"] + [f"{(x / x_denominator) * 100:.2f}%" for x in x_values])
+
+    for y_index, y_value in enumerate(y_values):
+        presentation_rows.append(
+            [
+                str(y_value // 64),
+                str(y_value % 64),
+                f"{(y_value / y_denominator) * 100:.2f}%",
+                *grid[y_index],
+            ]
+        )
+
+    return pd.DataFrame(presentation_rows)
+
+
 def build_phase_magnitude_display_table(df, parameter_name, rotation_degrees=0):
     """
     Build a spreadsheet-like table that shows magnitude and phase in degrees.
@@ -1221,6 +1300,77 @@ def build_reflection_display_table(df, parameter_name, orientation):
     return pd.DataFrame(presentation_rows)
 
 
+def _efficiency_mode_label(efficiency_mode):
+    if efficiency_mode == "abcd_power":
+        return "ηABCD = PL / Pin"
+    if efficiency_mode == "h_squared":
+        return "|S21|²·(1−|S22|²) / |1−S22²|²"
+    if efficiency_mode == "overall":
+        return "ηoverall = (1 - |S11|²) × |S21|²"
+    if efficiency_mode == "s21_squared":
+        return "|S21|²"
+    raise ValueError(f"Unknown efficiency mode: {efficiency_mode}")
+
+
+def calculate_efficiency_value(s11, s21, s12, s22, efficiency_mode, z0=DEFAULT_Z0):
+    s11_magnitude = abs(s11)
+    s21_magnitude = abs(s21)
+
+    if efficiency_mode == "abcd_power":
+        gamma_load = np.conj(s22)
+        z_load = reflect_to_impedance_value(gamma_load.real, gamma_load.imag, z0)
+        if z_load is None:
+            return None
+
+        z_values = s_to_z_parameter_values(s11, s21, s12, s22, z0)
+        if z_values is None:
+            return None
+
+        abcd_values = z_to_abcd_parameter_values(
+            z_values["Z11"],
+            z_values["Z12"],
+            z_values["Z21"],
+            z_values["Z22"],
+        )
+        if abcd_values is None:
+            return None
+
+        i_load = 1.0 + 0.0j
+        v2 = z_load * i_load
+        v1 = (abcd_values["A"] * v2) + (abcd_values["B"] * i_load)
+        i1 = (abcd_values["C"] * v2) + (abcd_values["D"] * i_load)
+        if abs(i1) < 1e-18:
+            return None
+
+        z_in = v1 / i1
+        if not np.isfinite(z_in.real) or not np.isfinite(z_in.imag):
+            return None
+
+        p_in = z_in.real * (abs(i1) ** 2)
+        p_load = z_load.real * (abs(i_load) ** 2)
+        if not np.isfinite(p_in) or not np.isfinite(p_load) or p_in <= 1e-18:
+            return None
+
+        return p_load / p_in
+
+    if efficiency_mode == "h_squared":
+        gamma_l = s22
+        gamma_l_sq = abs(gamma_l) ** 2
+        denom = 1.0 - s22 * gamma_l
+        denom_sq = abs(denom) ** 2
+        if denom_sq < 1e-18:
+            return None
+        return (s21_magnitude ** 2) * (1.0 - gamma_l_sq) / denom_sq
+
+    if efficiency_mode == "overall":
+        return (1.0 - (s11_magnitude ** 2)) * (s21_magnitude ** 2)
+
+    if efficiency_mode == "s21_squared":
+        return s21_magnitude ** 2
+
+    raise ValueError(f"Unknown efficiency mode: {efficiency_mode}")
+
+
 def build_efficiency_display_table(df, efficiency_mode):
     """
     Build a spreadsheet-like X-Y table showing efficiency values.
@@ -1229,13 +1379,19 @@ def build_efficiency_display_table(df, efficiency_mode):
     s11_x_col = "S11_x"
     s21_r_col = "S21_r"
     s21_x_col = "S21_x"
+    s12_r_col = "S12_r"
+    s12_x_col = "S12_x"
     s22_r_col = "S22_r"
     s22_x_col = "S22_x"
 
-    if not all(col in df.columns for col in [s11_r_col, s11_x_col, s21_r_col, s21_x_col]):
-        raise ValueError("Missing S11 or S21 columns required for efficiency calculation.")
+    required_cols = [s11_r_col, s11_x_col, s21_r_col, s21_x_col]
+    if efficiency_mode == "abcd_power":
+        required_cols.extend([s12_r_col, s12_x_col, s22_r_col, s22_x_col])
+    elif efficiency_mode == "h_squared":
+        required_cols.extend([s22_r_col, s22_x_col])
 
-    has_s22 = all(col in df.columns for col in [s22_r_col, s22_x_col])
+    if not all(col in df.columns for col in required_cols):
+        raise ValueError(f"Missing columns required for efficiency calculation: {_efficiency_mode_label(efficiency_mode)}")
 
     x_values, y_values = extract_xy_axis_values(df)
 
@@ -1246,10 +1402,13 @@ def build_efficiency_display_table(df, efficiency_mode):
 
     grid = [["" for _ in x_values] for _ in y_values]
 
-    if efficiency_mode == "h_squared" and has_s22:
-        iter_cols = ["X_C1", "Y_C2", s11_r_col, s11_x_col, s21_r_col, s21_x_col, s22_r_col, s22_x_col]
-    else:
-        iter_cols = ["X_C1", "Y_C2", s11_r_col, s11_x_col, s21_r_col, s21_x_col]
+    iter_cols = [
+        "X_C1", "Y_C2",
+        s11_r_col, s11_x_col,
+        s21_r_col, s21_x_col,
+        s12_r_col, s12_x_col,
+        s22_r_col, s22_x_col,
+    ]
 
     for row in df[iter_cols].itertuples(index=False):
         x_pos = int(row[0])
@@ -1258,41 +1417,27 @@ def build_efficiency_display_table(df, efficiency_mode):
         s11_imag = row[3]
         s21_real = row[4]
         s21_imag = row[5]
-        if pd.isna(s11_real) or pd.isna(s11_imag) or pd.isna(s21_real) or pd.isna(s21_imag):
+        s12_real = row[6]
+        s12_imag = row[7]
+        s22_real = row[8]
+        s22_imag = row[9]
+        required_values = [s11_real, s11_imag, s21_real, s21_imag]
+        if efficiency_mode == "abcd_power":
+            required_values.extend([s12_real, s12_imag, s22_real, s22_imag])
+        elif efficiency_mode == "h_squared":
+            required_values.extend([s22_real, s22_imag])
+        if any(pd.isna(value) for value in required_values):
             continue
         s11 = complex(s11_real, s11_imag)
         s21 = complex(s21_real, s21_imag)
-        s11_magnitude = abs(s11)
-        s21_magnitude = abs(s21)
-        if efficiency_mode == "h_squared" and has_s22 and len(row) >= 8:
-            s22_real = row[6]
-            s22_imag = row[7]
-            if pd.isna(s22_real) or pd.isna(s22_imag):
-                continue
-            s22 = complex(s22_real, s22_imag)
-            # Γ_L = S22 (ZL derived from S22 → Γ_L = (ZL−Z0)/(ZL+Z0) = S22)
-            gamma_l = s22
-            gamma_l_sq = abs(gamma_l) ** 2          # |Γ_L|²
-            denom = 1.0 - s22 * gamma_l              # 1 − S22²
-            denom_sq = abs(denom) ** 2
-            if denom_sq < 1e-18:
-                continue
-            # G_T = |S21|² × (1 − |Γ_L|²) / |1 − S22·Γ_L|²
-            efficiency = (s21_magnitude ** 2) * (1.0 - gamma_l_sq) / denom_sq
-        elif efficiency_mode == "overall":
-            efficiency = (1.0 - (s11_magnitude ** 2)) * (s21_magnitude ** 2)
-        elif efficiency_mode == "s21_squared":
-            efficiency = s21_magnitude ** 2
-        else:
-            raise ValueError(f"Unknown efficiency mode: {efficiency_mode}")
+        s12 = complex(s12_real, s12_imag) if not (pd.isna(s12_real) or pd.isna(s12_imag)) else 0.0 + 0.0j
+        s22 = complex(s22_real, s22_imag) if not (pd.isna(s22_real) or pd.isna(s22_imag)) else 0.0 + 0.0j
+        efficiency = calculate_efficiency_value(s11, s21, s12, s22, efficiency_mode)
+        if efficiency is None or not np.isfinite(efficiency):
+            continue
         grid[y_lookup[y_pos]][x_lookup[x_pos]] = f"{efficiency:.4f}"
 
-    if efficiency_mode == "h_squared":
-        mode_label = "|S21|²·(1−|S22|²) / |1−S22²|²"
-    elif efficiency_mode == "overall":
-        mode_label = "ηoverall = (1 - |S11|²) × |S21|²"
-    else:
-        mode_label = "|S21|²"
+    mode_label = _efficiency_mode_label(efficiency_mode)
 
     presentation_rows = []
     presentation_rows.append(["", "", "c1 coarse"] + [str(x // 64) for x in x_values])
@@ -1424,11 +1569,12 @@ def build_smith_dgamma_lookup(df, parameter_name, orientation):
     return dgamma_lookup
 
 
-def build_smith_efficiency_lookup(df, efficiency_mode="h_squared"):
+def build_smith_efficiency_lookup(df, efficiency_mode="abcd_power"):
     """
     Build a lookup table for Smith-chart efficiency coloring.
-    Supports three modes:
-      'h_squared' : |S21|²·(1−|S22|²) / |1−S22²|²  (default)
+    Supports four modes:
+      'abcd_power': ηABCD = PL / Pin  (default)
+      'h_squared' : |S21|²·(1−|S22|²) / |1−S22²|²
       'overall'   : (1 - |S11|²) × |S21|²
       's21_squared': |S21|²
     """
@@ -1436,18 +1582,27 @@ def build_smith_efficiency_lookup(df, efficiency_mode="h_squared"):
     s11_x_col = "S11_x"
     s21_r_col = "S21_r"
     s21_x_col = "S21_x"
+    s12_r_col = "S12_r"
+    s12_x_col = "S12_x"
     s22_r_col = "S22_r"
     s22_x_col = "S22_x"
 
-    if not all(col in df.columns for col in [s11_r_col, s11_x_col, s21_r_col, s21_x_col]):
+    required_cols = [s11_r_col, s11_x_col, s21_r_col, s21_x_col]
+    if efficiency_mode == "abcd_power":
+        required_cols.extend([s12_r_col, s12_x_col, s22_r_col, s22_x_col])
+    elif efficiency_mode == "h_squared":
+        required_cols.extend([s22_r_col, s22_x_col])
+
+    if not all(col in df.columns for col in required_cols):
         return {}
 
-    has_s22 = all(col in df.columns for col in [s22_r_col, s22_x_col])
-
-    if efficiency_mode == "h_squared" and has_s22:
-        iter_cols = ["X_C1", "Y_C2", s11_r_col, s11_x_col, s21_r_col, s21_x_col, s22_r_col, s22_x_col]
-    else:
-        iter_cols = ["X_C1", "Y_C2", s11_r_col, s11_x_col, s21_r_col, s21_x_col]
+    iter_cols = [
+        "X_C1", "Y_C2",
+        s11_r_col, s11_x_col,
+        s21_r_col, s21_x_col,
+        s12_r_col, s12_x_col,
+        s22_r_col, s22_x_col,
+    ]
 
     efficiency_lookup = {}
     for row in df[iter_cols].itertuples(index=False):
@@ -1457,31 +1612,24 @@ def build_smith_efficiency_lookup(df, efficiency_mode="h_squared"):
         s11_imag = row[3]
         s21_real = row[4]
         s21_imag = row[5]
-        if pd.isna(s11_real) or pd.isna(s11_imag) or pd.isna(s21_real) or pd.isna(s21_imag):
+        s12_real = row[6]
+        s12_imag = row[7]
+        s22_real = row[8]
+        s22_imag = row[9]
+        required_values = [s11_real, s11_imag, s21_real, s21_imag]
+        if efficiency_mode == "abcd_power":
+            required_values.extend([s12_real, s12_imag, s22_real, s22_imag])
+        elif efficiency_mode == "h_squared":
+            required_values.extend([s22_real, s22_imag])
+        if any(pd.isna(value) for value in required_values):
             continue
         s11 = complex(s11_real, s11_imag)
         s21 = complex(s21_real, s21_imag)
-        s11_magnitude = abs(s11)
-        s21_magnitude = abs(s21)
-        if efficiency_mode == "h_squared" and has_s22 and len(row) >= 8:
-            s22_real = row[6]
-            s22_imag = row[7]
-            if pd.isna(s22_real) or pd.isna(s22_imag):
-                continue
-            s22 = complex(s22_real, s22_imag)
-            # Γ_L = S22 (ZL derived from S22 → Γ_L = (ZL−Z0)/(ZL+Z0) = S22)
-            gamma_l = s22
-            gamma_l_sq = abs(gamma_l) ** 2
-            denom = 1.0 - s22 * gamma_l              # 1 − S22²
-            denom_sq = abs(denom) ** 2
-            if denom_sq < 1e-18:
-                continue
-            # G_T = |S21|² × (1 − |Γ_L|²) / |1 − S22·Γ_L|²
-            efficiency = (s21_magnitude ** 2) * (1.0 - gamma_l_sq) / denom_sq
-        elif efficiency_mode == "overall":
-            efficiency = (1.0 - (s11_magnitude ** 2)) * (s21_magnitude ** 2)
-        else:
-            efficiency = s21_magnitude ** 2
+        s12 = complex(s12_real, s12_imag) if not (pd.isna(s12_real) or pd.isna(s12_imag)) else 0.0 + 0.0j
+        s22 = complex(s22_real, s22_imag) if not (pd.isna(s22_real) or pd.isna(s22_imag)) else 0.0 + 0.0j
+        efficiency = calculate_efficiency_value(s11, s21, s12, s22, efficiency_mode)
+        if efficiency is None or not np.isfinite(efficiency):
+            continue
         efficiency_lookup[(x_pos, y_pos)] = float(efficiency)
 
     return efficiency_lookup
@@ -1856,13 +2004,15 @@ class MatchResolutionGui(QMainWindow):
         self.current_impedance_parameter = "S22"
         self.df_zpar_display = None
         self.current_zpar_parameter = "Z22"
+        self.df_abcd_display = None
+        self.current_abcd_parameter = "A"
         self.df_dz_display = None
         self.current_dz_parameter = "S22 horizontal"
         self.df_reflection_display = None
         self.current_reflection_parameter = "S22"
         self.current_reflection_mode = "horizontal"
         self.df_efficiency_display = None
-        self.current_efficiency_mode = "h_squared"
+        self.current_efficiency_mode = "abcd_power"
         self.smith_manual_points = []
         self.smith_search_result = None
         self.manual_impedance_model = None
@@ -2391,6 +2541,57 @@ class MatchResolutionGui(QMainWindow):
         """)
         self.zpar_table_page = self.create_table_page(self.zpar_table_view, zpar_toolbar)
         self.tabs.addTab(self.zpar_table_page, "Zpar")
+
+        abcd_toolbar = QFrame()
+        abcd_toolbar.setStyleSheet("""
+            QFrame {
+                background-color: #EDE7F6;
+                border-radius: 10px;
+                padding: 8px;
+            }
+        """)
+        abcd_toolbar_layout = QHBoxLayout(abcd_toolbar)
+
+        abcd_toolbar_layout.addWidget(QLabel("Parameter:"))
+        self.abcd_parameter_combo = QComboBox()
+        self.abcd_parameter_combo.addItems(ABCD_PARAMETERS)
+        self.abcd_parameter_combo.setCurrentText("A")
+        self.abcd_parameter_combo.currentTextChanged.connect(self.refresh_abcd_table)
+        abcd_toolbar_layout.addWidget(self.abcd_parameter_combo)
+
+        abcd_toolbar_layout.addWidget(QLabel("Z-parameters are converted to ABCD matrix [V1 I1]T = [A B; C D][V2 -I2]T."))
+        self.abcd_cell_label = QLabel("Click a cell to see the value here.")
+        self.abcd_cell_label.setStyleSheet("""
+            QLabel {
+                color: #4527A0;
+                background-color: #EDE7F6;
+                border: 1px solid #9575CD;
+                border-radius: 8px;
+                padding: 6px 10px;
+                font-weight: bold;
+            }
+        """)
+        abcd_toolbar_layout.addWidget(self.abcd_cell_label, stretch=1)
+        abcd_toolbar_layout.addStretch(1)
+
+        self.abcd_table_view = QTableView()
+        self.abcd_table_view.setAlternatingRowColors(False)
+        self.abcd_table_view.setStyleSheet("""
+            QTableView {
+                background-color: white;
+                gridline-color: #90A4AE;
+                font-size: 12px;
+            }
+            QHeaderView::section {
+                background-color: #673AB7;
+                color: white;
+                padding: 4px;
+                border: 1px solid #9575CD;
+                font-weight: bold;
+            }
+        """)
+        self.abcd_table_page = self.create_table_page(self.abcd_table_view, abcd_toolbar)
+        self.tabs.addTab(self.abcd_table_page, "ABCD Matrix")
 
         dz_toolbar = QFrame()
         dz_toolbar.setStyleSheet("""
@@ -2945,6 +3146,7 @@ class MatchResolutionGui(QMainWindow):
 
         efficiency_toolbar_layout.addWidget(QLabel("Formula:"))
         self.efficiency_mode_combo = QComboBox()
+        self.efficiency_mode_combo.addItem("ηABCD = PL / Pin", "abcd_power")
         self.efficiency_mode_combo.addItem("|S21|²·(1−|S22|²) / |1−S22²|²", "h_squared")
         self.efficiency_mode_combo.addItem("|S21|²", "s21_squared")
         self.efficiency_mode_combo.addItem("ηoverall = (1 - |S11|²) × |S21|²", "overall")
@@ -3036,7 +3238,7 @@ class MatchResolutionGui(QMainWindow):
         main_layout.addWidget(self.tabs, stretch=1)
 
         note = QLabel(
-            "Note: Display tab shows the converted row table. X-Y Table shows the grid view for the selected S-parameter. Zpar shows the converted Z-parameters. dZ shows delta impedance for S22. Reflect Coefficient tab shows delta-Γ resolution from X-Y data. Efficiency tab lets you switch between |S21|²·(1−|S22|²)/|1−S22²|² (default), |S21|², and ηoverall = (1 - |S11|²) × |S21|². Smith Chart supports X-Y Table, dZ, dΓ, Efficiency coloring modes, manual R/X points, ZL search by C1/C2, and one-click demo plotting."
+            "Note: Display tab shows the converted row table. X-Y Table shows the grid view for the selected S-parameter. Zpar shows the converted Z-parameters. ABCD Matrix shows the converted ABCD terms. dZ shows delta impedance for S22. Reflect Coefficient tab shows delta-Γ resolution from X-Y data. Efficiency tab lets you switch between ηABCD = PL / Pin (default), |S21|²·(1−|S22|²)/|1−S22²|², |S21|², and ηoverall = (1 - |S11|²) × |S21|². Smith Chart supports X-Y Table, dZ, dΓ, Efficiency coloring modes, manual R/X points, ZL search by C1/C2, and one-click demo plotting."
         )
         note.setAlignment(Qt.AlignCenter)
         note.setStyleSheet("font-size: 13px; color: #607D8B; padding: 6px;")
@@ -3752,7 +3954,7 @@ class MatchResolutionGui(QMainWindow):
         if selection_model is not None:
             selection_model.currentChanged.connect(self.update_zpar_cell_label)
         self.zpar_cell_label.setText("Click a cell to see the value here.")
-        self._apply_freeze_panes(self.zpar_table_view, freeze_rows=3, freeze_cols=3)
+        self._apply_freeze_panes(self.zpar_table_view, freeze_rows=4, freeze_cols=4)
 
     def update_zpar_cell_label(self, current, previous):
         if not current.isValid() or self.df_zpar_display is None:
@@ -3770,6 +3972,45 @@ class MatchResolutionGui(QMainWindow):
             self.zpar_cell_label.setText(f"Row {row + 1}, Col {column + 1}: empty")
         else:
             self.zpar_cell_label.setText(f"Row {row + 1}, Col {column + 1}: {value}")
+
+    def refresh_abcd_table(self):
+        if self.df_all is None or self.df_all.empty:
+            return
+
+        self.current_abcd_parameter = self.abcd_parameter_combo.currentText().strip()
+        self.df_abcd_display = build_abcd_display_table(self.df_all, self.current_abcd_parameter)
+
+        self.abcd_table_model = PandasTableModel(self.df_abcd_display)
+        self.abcd_table_view.setModel(self.abcd_table_model)
+        self.abcd_table_view.horizontalHeader().setVisible(False)
+        self.abcd_table_view.verticalHeader().setVisible(False)
+        self.abcd_table_view.horizontalHeader().setSectionResizeMode(QHeaderView.Fixed)
+        self.abcd_table_view.horizontalHeader().setDefaultSectionSize(80)
+        self.abcd_table_view.verticalHeader().setDefaultSectionSize(24)
+        self.abcd_table_view.setSelectionBehavior(QTableView.SelectItems)
+        self.abcd_table_view.setSelectionMode(QTableView.SingleSelection)
+        selection_model = self.abcd_table_view.selectionModel()
+        if selection_model is not None:
+            selection_model.currentChanged.connect(self.update_abcd_cell_label)
+        self.abcd_cell_label.setText("Click a cell to see the value here.")
+        self._apply_freeze_panes(self.abcd_table_view, freeze_rows=4, freeze_cols=4)
+
+    def update_abcd_cell_label(self, current, previous):
+        if not current.isValid() or self.df_abcd_display is None:
+            self.abcd_cell_label.setText("Click a cell to see the value here.")
+            return
+
+        row = current.row()
+        column = current.column()
+        if row >= len(self.df_abcd_display.index) or column >= len(self.df_abcd_display.columns):
+            self.abcd_cell_label.setText("Click a cell to see the value here.")
+            return
+
+        value = self.df_abcd_display.iat[row, column]
+        if value == "":
+            self.abcd_cell_label.setText(f"Row {row + 1}, Col {column + 1}: empty")
+        else:
+            self.abcd_cell_label.setText(f"Row {row + 1}, Col {column + 1}: {value}")
 
     def update_impedance_cell_label(self, current, previous):
         if not current.isValid() or self.df_impedance_display is None:
@@ -4905,6 +5146,7 @@ class MatchResolutionGui(QMainWindow):
             self.refresh_contour_table()
             self.refresh_impedance_table()
             self.refresh_zpar_table()
+            self.refresh_abcd_table()
             self.refresh_dz_table()
             self.refresh_reflection_table()
             self.refresh_efficiency_table()
@@ -4951,6 +5193,7 @@ class MatchResolutionGui(QMainWindow):
                 f"Efficiency tab uses {self.efficiency_mode_combo.currentText()}.\n"
                 f"Contour tab uses {self.current_contour_parameter}.\n"
                 f"Zpar tab uses {self.current_zpar_parameter}.\n"
+                f"ABCD Matrix tab uses {self.current_abcd_parameter}.\n"
                 f"Smith Chart uses {self.current_smith_parameter}."
             )
 
@@ -4971,6 +5214,8 @@ class MatchResolutionGui(QMainWindow):
             default_name = base_name + f"_{self.current_impedance_parameter.lower()}_impedance_table.csv"
         elif current_tab == "Zpar" and self.df_zpar_display is not None:
             default_name = base_name + f"_{self.current_zpar_parameter.lower()}_zpar_table.csv"
+        elif current_tab == "ABCD Matrix" and self.df_abcd_display is not None:
+            default_name = base_name + f"_{self.current_abcd_parameter.lower()}_abcd_matrix_table.csv"
         elif current_tab == "dZ" and self.df_dz_display is not None:
             default_name = base_name + f"_{self.current_dz_parameter.lower().replace(' ', '_')}_dz_table.csv"
         elif current_tab == "Reflect Coefficient" and self.df_reflection_display is not None:
@@ -5001,6 +5246,10 @@ class MatchResolutionGui(QMainWindow):
         try:
             if current_tab == "Impedance" and self.df_impedance_display is not None:
                 self.df_impedance_display.to_csv(save_path, index=False, header=False)
+            elif current_tab == "Zpar" and self.df_zpar_display is not None:
+                self.df_zpar_display.to_csv(save_path, index=False, header=False)
+            elif current_tab == "ABCD Matrix" and self.df_abcd_display is not None:
+                self.df_abcd_display.to_csv(save_path, index=False, header=False)
             elif current_tab == "dZ" and self.df_dz_display is not None:
                 self.df_dz_display.to_csv(save_path, index=False, header=False)
             elif current_tab == "Reflect Coefficient" and self.df_reflection_display is not None:
