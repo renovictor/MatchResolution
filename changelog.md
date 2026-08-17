@@ -1,5 +1,13 @@
 # Changelog
 
+## V2.0.2
+
+- Added a new **Iout** tab next to **Efficiency**.
+- Added **Input power (W)** input for Iout calculation with default **100 W**.
+- Implemented Iout calculation using **`Iout = -C·V1 + A·I1`** with fixed input impedance **`Zin = 50 Ω`**.
+- Updated Iout display to show **RMS current magnitude** (A) instead of complex values.
+- Added CSV export support for the Iout table.
+
 ## V2.0.1
 
 - Fixed `S12` sign inversion in `T -> S` conversion by correcting the sign in the `s12` reconstruction formula.
