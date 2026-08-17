@@ -1,4 +1,4 @@
-# MatchResolution User Manual (v2.0.1)
+# MatchResolution User Manual (v2.0.2)
 
 ## 1. What this app does
 
@@ -7,7 +7,7 @@ MatchResolution converts RF matching datasets into analysis views and charts:
 - **X-Y Table** for selected S-parameter
 - **Phase Magnitude** table with 0-360° rotation
 - **Contour** edge-only table and Smith view
-- **Impedance**, **Zpar**, **ABCD Matrix**, **dZ**, **Reflect Coefficient**, **Efficiency**
+- **Impedance**, **Zpar**, **ABCD Matrix**, **dZ**, **Reflect Coefficient**, **Efficiency**, **Iout**
 - **Smith Chart** with search, manual points, P/M mode, and image save
 - **Component Analysis** — Cap Array Resolution plots
 
@@ -31,7 +31,7 @@ During conversion, the app can **de-embed cable effects** using Cable1/Cable2 S-
 ### EXE mode (Windows)
 Run:
 ```powershell
-.\dist\MatchResolution_V2.0.1.exe
+.\dist\MatchResolution_V2.0.2.exe
 ```
 
 The app opens **maximized** by default.
@@ -107,6 +107,11 @@ All tabs and plots use these de-embedded S-parameters.
   - `|S21|²`
   - `ηoverall = (1 − |S11|²) × |S21|²`
   - Good η threshold defaults to **100%**; Poor η threshold defaults to **10%**
+- **Iout**: RMS output current table based on ABCD terms:
+  - Formula: `Iout = -C·V1 + A·I1`
+  - Input power is user-editable in the Iout tab (**default 100 W**)
+  - Input impedance is fixed at **50 Ω**
+  - Table displays **`|Iout|` RMS in A** (real scalar)
 - **Smith Chart**:
   - Modes: X-Y Table / dZ / dΓ / Efficiency / Contour / P/M
   - Efficiency coloring uses the same formula selected in the Efficiency tab
@@ -120,7 +125,7 @@ All tabs and plots use these de-embedded S-parameters.
   - C1: Coarse=75, Fine6=43, Fine5=34, Fine4=15, Fine3=0.1, Fine2=4.7, Fine1=2.2 pF
   - C2: Coarse=75, Fine6=75, Fine5=43, Fine4=21, Fine3=15, Fine2=0.1, Fine1=4.7 pF
 
-For these analysis tables — **X-Y Table**, **Phase Magnitude**, **Contour**, **Impedance**, **Zpar**, **ABCD Matrix**, **Reflect Coefficient**, and **Efficiency** — the view uses freeze panes at **row 4 / column 4** so C1/C2 coarse/fine/percentage remain visible while scrolling.
+For these analysis tables — **X-Y Table**, **Phase Magnitude**, **Contour**, **Impedance**, **Zpar**, **ABCD Matrix**, **Reflect Coefficient**, **Efficiency**, and **Iout** — the view uses freeze panes at **row 4 / column 4** so C1/C2 coarse/fine/percentage remain visible while scrolling.
 
 ---
 
@@ -148,7 +153,7 @@ Additional formulas remain available in the Formula dropdown:
 ## 8. Export behavior
 
 **Export CSV** exports data for the currently selected tab:
-- X-Y Table / Phase Magnitude / Contour / Impedance / Zpar / ABCD Matrix / dZ / Reflect Coefficient / Efficiency views export grid-style tables.
+- X-Y Table / Phase Magnitude / Contour / Impedance / Zpar / ABCD Matrix / dZ / Reflect Coefficient / Efficiency / Iout views export grid-style tables.
 - Otherwise, default export uses main converted table.
 
 ---
