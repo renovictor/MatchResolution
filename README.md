@@ -1,4 +1,4 @@
-# MatchResolution User Manual (v2.0.0)
+# MatchResolution User Manual (v2.0.1)
 
 ## 1. What this app does
 
@@ -7,7 +7,7 @@ MatchResolution converts RF matching datasets into analysis views and charts:
 - **X-Y Table** for selected S-parameter
 - **Phase Magnitude** table with 0-360° rotation
 - **Contour** edge-only table and Smith view
-- **Impedance**, **dZ**, **Reflect Coefficient**, **Efficiency**
+- **Impedance**, **Zpar**, **ABCD Matrix**, **dZ**, **Reflect Coefficient**, **Efficiency**
 - **Smith Chart** with search, manual points, P/M mode, and image save
 - **Component Analysis** — Cap Array Resolution plots
 
@@ -31,7 +31,7 @@ During conversion, the app can **de-embed cable effects** using Cable1/Cable2 S-
 ### EXE mode (Windows)
 Run:
 ```powershell
-.\dist\MatchResolution_V2.0.0.exe
+.\dist\MatchResolution_V2.0.1.exe
 ```
 
 The app opens **maximized** by default.
@@ -97,10 +97,13 @@ All tabs and plots use these de-embedded S-parameters.
 - **Phase Magnitude**: magnitude/phase table with a 0-360° rotation control on the Smith Chart tab.
 - **Contour**: edge-only grid view and contour Smith mode.
 - **Impedance**: derived impedance table/plot.
+- **Zpar**: derived `Z11 / Z21 / Z12 / Z22` grid table.
+- **ABCD Matrix**: derived `A / B / C / D` grid table converted from the 2-port matrix.
 - **dZ**: delta-impedance maps.
 - **Reflect Coefficient**: delta-Γ analysis.
-- **Efficiency**: power transmission efficiency table with three selectable formulas:
-  - `|S21|²·(1−|S22|²) / |1−S22²|²` — correct transducer gain G_T **(default)**
+- **Efficiency**: power transmission efficiency table with four selectable formulas:
+  - `ηABCD = PL / Pin` — ABCD-based calculation using `conj(S22)` as the load reflection coefficient **(default)**
+  - `|S21|²·(1−|S22|²) / |1−S22²|²` — transducer gain `G_T`
   - `|S21|²`
   - `ηoverall = (1 − |S11|²) × |S21|²`
   - Good η threshold defaults to **100%**; Poor η threshold defaults to **10%**
@@ -117,22 +120,35 @@ All tabs and plots use these de-embedded S-parameters.
   - C1: Coarse=75, Fine6=43, Fine5=34, Fine4=15, Fine3=0.1, Fine2=4.7, Fine1=2.2 pF
   - C2: Coarse=75, Fine6=75, Fine5=43, Fine4=21, Fine3=15, Fine2=0.1, Fine1=4.7 pF
 
+For these analysis tables — **X-Y Table**, **Phase Magnitude**, **Contour**, **Impedance**, **Zpar**, **ABCD Matrix**, **Reflect Coefficient**, and **Efficiency** — the view uses freeze panes at **row 4 / column 4** so C1/C2 coarse/fine/percentage remain visible while scrolling.
+
 ---
 
 ## 7. Efficiency formula
 
-The default efficiency formula is the **transducer power gain** with Γ_L derived from S22:
+The default efficiency formula is the **ABCD-based power calculation**:
 
-$$G_T = \frac{|S_{21}|^2 \cdot (1 - |S_{22}|^2)}{|1 - S_{22}^2|^2}$$
+1. Use `conj(S22)` as the load reflection coefficient.
+2. Convert that load reflection coefficient to `ZL`.
+3. Convert the 2-port `S` matrix to `Z`, then to `ABCD`.
+4. Assume `IL = 1 Arms`.
+5. Compute `V2 = ZL × IL`.
+6. Compute `V1 = A×V2 + B×IL` and `I1 = C×V2 + D×IL`.
+7. Compute `Zin = V1 / I1`.
+8. Compute `PL = Re(ZL) × |IL|²`, `Pin = Re(Zin) × |I1|²`, and `η = PL / Pin`.
 
-This is always ≤ 100% for passive networks. The two legacy formulas (`|S21|²` and `ηoverall`) are still available in the Formula dropdown.
+Additional formulas remain available in the Formula dropdown:
+
+- `|S21|²·(1−|S22|²) / |1−S22²|²`
+- `|S21|²`
+- `ηoverall = (1 − |S11|²) × |S21|²`
 
 ---
 
 ## 8. Export behavior
 
 **Export CSV** exports data for the currently selected tab:
-- X-Y Table / Phase Magnitude / Contour / Impedance / dZ / Reflect Coefficient / Efficiency views export grid-style tables.
+- X-Y Table / Phase Magnitude / Contour / Impedance / Zpar / ABCD Matrix / dZ / Reflect Coefficient / Efficiency views export grid-style tables.
 - Otherwise, default export uses main converted table.
 
 ---

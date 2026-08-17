@@ -1,5 +1,22 @@
 # Changelog
 
+## V2.0.1
+
+- Fixed `S12` sign inversion in `T -> S` conversion by correcting the sign in the `s12` reconstruction formula.
+- Added **ABCD Matrix** tab next to **Zpar**, with selectable `A / B / C / D` terms derived from the converted 2-port matrix.
+- Added freeze panes for analysis tables to keep C1/C2 context visible while scrolling (freeze at row 4 / column 4):
+  - X-Y Table
+  - Phase Magnitude
+  - Contour
+  - Impedance
+  - Zpar
+  - ABCD Matrix
+  - Reflect Coefficient
+  - Efficiency
+- Fixed runtime error in freeze-pane event handling by importing `QEvent`.
+- Added a fourth **Efficiency** formula based on the **ABCD matrix** and made it the default mode.
+- Fixed the ABCD-efficiency load handling to use **conjugate `S22`** as the load reflection coefficient before converting to `ZL`.
+
 ## V2.0.0
 
 - **Efficiency formula correction:** replaced the incorrect `|S21/(1−S22²)|²` formula with the correct transducer gain formula `G_T = |S21|²·(1−|S22|²) / |1−S22²|²` (where Γ_L = S22 at each grid point), ensuring η never exceeds 100%.
