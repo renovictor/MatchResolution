@@ -1,5 +1,19 @@
 # Changelog
 
+## V2.0.3
+
+- Added a new default **Efficiency** formula using the single Z-parameter expression:
+  - `ηZ = Re{ZL}|Z21|² / Re{[Z11(ZL+Z22)-Z12Z21](ZL+Z22)*}`
+- Added **Vpp** analysis tab with:
+  - `Vrms = ZL·Z21·V1 / DZ`
+  - `Vpp = 2√2·Vrms`
+  - User-editable input power (default **100 W**) and fixed **50 Ω** input impedance.
+- Added **Derive η formula** tab with scrollable derivation notes for the Z-parameter efficiency equation.
+- Updated **Iout** tab to support two formulas and made `Iout = Z21·V1 / DZ` the default.
+- Updated startup behavior to open with **Smith Chart** selected by default.
+- Updated Smith Chart modes so **Efficiency** mode is the default.
+- Extended freeze panes coverage to include the new **Vpp** analysis table.
+
 ## V2.0.2
 
 - Added a new **Iout** tab next to **Efficiency**.
