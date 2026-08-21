@@ -1301,6 +1301,8 @@ def build_reflection_display_table(df, parameter_name, orientation):
 
 
 def _efficiency_mode_label(efficiency_mode):
+    if efficiency_mode == "z_single":
+        return "ηZ = Re{ZL}|Z21|² / Re{[Z11(ZL+Z22)-Z12Z21](ZL+Z22)*}"
     if efficiency_mode == "abcd_power":
         return "ηABCD = PL / Pin"
     if efficiency_mode == "h_squared":
@@ -1315,6 +1317,24 @@ def _efficiency_mode_label(efficiency_mode):
 def calculate_efficiency_value(s11, s21, s12, s22, efficiency_mode, z0=DEFAULT_Z0):
     s11_magnitude = abs(s11)
     s21_magnitude = abs(s21)
+
+    if efficiency_mode == "z_single":
+        gamma_load = np.conj(s22)
+        z_load = reflect_to_impedance_value(gamma_load.real, gamma_load.imag, z0)
+        if z_load is None:
+            return None
+
+        z_values = s_to_z_parameter_values(s11, s21, s12, s22, z0)
+        if z_values is None:
+            return None
+
+        z_sum = z_load + z_values["Z22"]
+        d_z = (z_values["Z11"] * z_sum) - (z_values["Z12"] * z_values["Z21"])
+        denominator = (d_z * np.conj(z_sum)).real
+        numerator = z_load.real * (abs(z_values["Z21"]) ** 2)
+        if not np.isfinite(denominator) or not np.isfinite(numerator) or denominator <= 1e-18:
+            return None
+        return numerator / denominator
 
     if efficiency_mode == "abcd_power":
         gamma_load = np.conj(s22)
@@ -1385,7 +1405,7 @@ def build_efficiency_display_table(df, efficiency_mode):
     s22_x_col = "S22_x"
 
     required_cols = [s11_r_col, s11_x_col, s21_r_col, s21_x_col]
-    if efficiency_mode == "abcd_power":
+    if efficiency_mode in ("z_single", "abcd_power"):
         required_cols.extend([s12_r_col, s12_x_col, s22_r_col, s22_x_col])
     elif efficiency_mode == "h_squared":
         required_cols.extend([s22_r_col, s22_x_col])
@@ -1422,7 +1442,7 @@ def build_efficiency_display_table(df, efficiency_mode):
         s22_real = row[8]
         s22_imag = row[9]
         required_values = [s11_real, s11_imag, s21_real, s21_imag]
-        if efficiency_mode == "abcd_power":
+        if efficiency_mode in ("z_single", "abcd_power"):
             required_values.extend([s12_real, s12_imag, s22_real, s22_imag])
         elif efficiency_mode == "h_squared":
             required_values.extend([s22_real, s22_imag])
@@ -1457,9 +1477,17 @@ def build_efficiency_display_table(df, efficiency_mode):
     return pd.DataFrame(presentation_rows)
 
 
-def build_iout_display_table(df, input_power_watts, z0=DEFAULT_Z0):
+def _iout_mode_label(iout_mode):
+    if iout_mode == "abcd":
+        return "Formula 1: Iout = -C·V1 + A·I1"
+    if iout_mode == "z_formula":
+        return "Formula 2: Iout = Z21·V1 / DZ"
+    raise ValueError(f"Unknown Iout mode: {iout_mode}")
+
+
+def build_iout_display_table(df, input_power_watts, iout_mode="z_formula", z0=DEFAULT_Z0):
     """
-    Build a spreadsheet-like X-Y table showing Iout = -C*V1 + A*I1.
+    Build a spreadsheet-like X-Y table showing Iout from the selected formula.
     Assumes input impedance is 50 ohm and power is user-defined.
     """
     required_columns = ["S11_r", "S11_x", "S21_r", "S21_x", "S12_r", "S12_x", "S22_r", "S22_x"]
@@ -1506,7 +1534,20 @@ def build_iout_display_table(df, input_power_watts, z0=DEFAULT_Z0):
         if abcd_values is None:
             continue
 
-        iout = (-abcd_values["C"] * v1) + (abcd_values["A"] * i1)
+        if iout_mode == "abcd":
+            iout = (-abcd_values["C"] * v1) + (abcd_values["A"] * i1)
+        elif iout_mode == "z_formula":
+            gamma_load = np.conj(s22)
+            z_load = reflect_to_impedance_value(gamma_load.real, gamma_load.imag, z0)
+            if z_load is None:
+                continue
+            z_sum = z_load + z_values["Z22"]
+            d_z = (z_values["Z11"] * z_sum) - (z_values["Z12"] * z_values["Z21"])
+            if abs(d_z) < 1e-18:
+                continue
+            iout = (z_values["Z21"] * v1) / d_z
+        else:
+            raise ValueError(f"Unknown Iout mode: {iout_mode}")
         if not np.isfinite(iout.real) or not np.isfinite(iout.imag):
             continue
         iout_rms = abs(iout)
@@ -1516,7 +1557,8 @@ def build_iout_display_table(df, input_power_watts, z0=DEFAULT_Z0):
 
     presentation_rows = []
     presentation_rows.append(["", "", "c1 coarse"] + [str(x // 64) for x in x_values])
-    presentation_rows.append(["", f"Iout RMS(A) (Pin={input_power_watts:.4g}W, Zin=50Ω)", "c1 fine"] + [str(x % 64) for x in x_values])
+    mode_label = _iout_mode_label(iout_mode)
+    presentation_rows.append(["", f"Iout RMS(A) ({mode_label}, Pin={input_power_watts:.4g}W, Zin=50Ω)", "c1 fine"] + [str(x % 64) for x in x_values])
     presentation_rows.append(["C2 coarse", "c2 fine", "percentage"] + [f"{(x / x_denominator) * 100:.2f}%" for x in x_values])
 
     for y_index, y_value in enumerate(y_values):
@@ -1531,6 +1573,82 @@ def build_iout_display_table(df, input_power_watts, z0=DEFAULT_Z0):
 
     return pd.DataFrame(presentation_rows)
 
+
+def build_vpp_display_table(df, input_power_watts, z0=DEFAULT_Z0):
+    """
+    Build a spreadsheet-like X-Y table showing Vpp from:
+      Vrms = ZL*Z21*V1 / DZ
+      Vpp = 2*sqrt(2)*|Vrms|
+    """
+    required_columns = ["S11_r", "S11_x", "S21_r", "S21_x", "S12_r", "S12_x", "S22_r", "S22_x"]
+    if not all(column in df.columns for column in required_columns):
+        raise ValueError("Missing S-parameter columns required for Vpp calculation.")
+    if input_power_watts <= 0:
+        raise ValueError("Input power must be greater than 0 W.")
+
+    x_values, y_values = extract_xy_axis_values(df)
+    x_lookup = {value: index for index, value in enumerate(x_values)}
+    y_lookup = {value: index for index, value in enumerate(y_values)}
+    x_denominator = max(x_values) if max(x_values) > 0 else 1
+    y_denominator = max(y_values) if max(y_values) > 0 else 1
+
+    input_impedance = 50.0
+    v1 = np.sqrt(input_power_watts * input_impedance)
+
+    grid = [["" for _ in x_values] for _ in y_values]
+    iter_cols = [
+        "X_C1", "Y_C2",
+        "S11_r", "S11_x",
+        "S21_r", "S21_x",
+        "S12_r", "S12_x",
+        "S22_r", "S22_x",
+    ]
+    for row in df[iter_cols].itertuples(index=False):
+        x_pos = int(row[0])
+        y_pos = int(row[1])
+        s11 = complex(row[2], row[3])
+        s21 = complex(row[4], row[5])
+        s12 = complex(row[6], row[7])
+        s22 = complex(row[8], row[9])
+
+        gamma_load = np.conj(s22)
+        z_load = reflect_to_impedance_value(gamma_load.real, gamma_load.imag, z0)
+        if z_load is None:
+            continue
+
+        z_values = s_to_z_parameter_values(s11, s21, s12, s22, z0)
+        if z_values is None:
+            continue
+
+        z_sum = z_load + z_values["Z22"]
+        d_z = (z_values["Z11"] * z_sum) - (z_values["Z12"] * z_values["Z21"])
+        if abs(d_z) < 1e-18:
+            continue
+
+        v_rms = (z_load * z_values["Z21"] * v1) / d_z
+        if not np.isfinite(v_rms.real) or not np.isfinite(v_rms.imag):
+            continue
+        vpp = 2.0 * np.sqrt(2.0) * abs(v_rms)
+        if not np.isfinite(vpp):
+            continue
+        grid[y_lookup[y_pos]][x_lookup[x_pos]] = f"{vpp:.6g}"
+
+    presentation_rows = []
+    presentation_rows.append(["", "", "c1 coarse"] + [str(x // 64) for x in x_values])
+    presentation_rows.append(["", f"Vpp(V) (Pin={input_power_watts:.4g}W, Zin=50Ω)", "c1 fine"] + [str(x % 64) for x in x_values])
+    presentation_rows.append(["C2 coarse", "c2 fine", "percentage"] + [f"{(x / x_denominator) * 100:.2f}%" for x in x_values])
+
+    for y_index, y_value in enumerate(y_values):
+        presentation_rows.append(
+            [
+                str(y_value // 64),
+                str(y_value % 64),
+                f"{(y_value / y_denominator) * 100:.2f}%",
+                *grid[y_index],
+            ]
+        )
+
+    return pd.DataFrame(presentation_rows)
 
 
 def build_smith_chart_plot_data(df, parameter_name):
@@ -1644,11 +1762,12 @@ def build_smith_dgamma_lookup(df, parameter_name, orientation):
     return dgamma_lookup
 
 
-def build_smith_efficiency_lookup(df, efficiency_mode="abcd_power"):
+def build_smith_efficiency_lookup(df, efficiency_mode="z_single"):
     """
     Build a lookup table for Smith-chart efficiency coloring.
-    Supports four modes:
-      'abcd_power': ηABCD = PL / Pin  (default)
+    Supports five modes:
+      'z_single' : ηZ = Re{ZL}|Z21|² / Re{[Z11(ZL+Z22)-Z12Z21](ZL+Z22)*} (default)
+      'abcd_power': ηABCD = PL / Pin
       'h_squared' : |S21|²·(1−|S22|²) / |1−S22²|²
       'overall'   : (1 - |S11|²) × |S21|²
       's21_squared': |S21|²
@@ -1663,7 +1782,7 @@ def build_smith_efficiency_lookup(df, efficiency_mode="abcd_power"):
     s22_x_col = "S22_x"
 
     required_cols = [s11_r_col, s11_x_col, s21_r_col, s21_x_col]
-    if efficiency_mode == "abcd_power":
+    if efficiency_mode in ("z_single", "abcd_power"):
         required_cols.extend([s12_r_col, s12_x_col, s22_r_col, s22_x_col])
     elif efficiency_mode == "h_squared":
         required_cols.extend([s22_r_col, s22_x_col])
@@ -1692,7 +1811,7 @@ def build_smith_efficiency_lookup(df, efficiency_mode="abcd_power"):
         s22_real = row[8]
         s22_imag = row[9]
         required_values = [s11_real, s11_imag, s21_real, s21_imag]
-        if efficiency_mode == "abcd_power":
+        if efficiency_mode in ("z_single", "abcd_power"):
             required_values.extend([s12_real, s12_imag, s22_real, s22_imag])
         elif efficiency_mode == "h_squared":
             required_values.extend([s22_real, s22_imag])
@@ -2087,9 +2206,12 @@ class MatchResolutionGui(QMainWindow):
         self.current_reflection_parameter = "S22"
         self.current_reflection_mode = "horizontal"
         self.df_efficiency_display = None
-        self.current_efficiency_mode = "abcd_power"
+        self.current_efficiency_mode = "z_single"
         self.df_iout_display = None
+        self.current_iout_mode = "z_formula"
         self.input_power_watts = 100.0
+        self.df_vpp_display = None
+        self.vpp_power_watts = 100.0
         self.smith_manual_points = []
         self.smith_search_result = None
         self.manual_impedance_model = None
@@ -2099,7 +2221,7 @@ class MatchResolutionGui(QMainWindow):
         self.smith_plot_values = np.array([], dtype=complex)
         self.smith_scatter = None
         self.smith_conjugate_enabled = False
-        self.current_smith_mode = "xy"
+        self.current_smith_mode = "efficiency"
         self.smith_dz_lookup = {}
         self.smith_dgamma_lookup = {}
         self.smith_efficiency_lookup = {}
@@ -2413,6 +2535,7 @@ class MatchResolutionGui(QMainWindow):
                 font-weight: bold;
             }
         """)
+        self._enable_table_hover_highlight(self.xy_table_view)
         self.xy_tab = self.create_table_page(self.xy_table_view, xy_toolbar)
         self.tabs.addTab(self.xy_tab, "X-Y Table")
 
@@ -2463,6 +2586,7 @@ class MatchResolutionGui(QMainWindow):
                 font-weight: bold;
             }
         """)
+        self._enable_table_hover_highlight(self.phase_table_view)
         self.phase_tab = self.create_table_page(self.phase_table_view, phase_toolbar)
         self.tabs.addTab(self.phase_tab, "Phase Magnitude")
 
@@ -2514,6 +2638,7 @@ class MatchResolutionGui(QMainWindow):
                 font-weight: bold;
             }
         """)
+        self._enable_table_hover_highlight(self.contour_table_view)
         self.contour_tab = self.create_table_page(self.contour_table_view, contour_toolbar)
         self.tabs.addTab(self.contour_tab, "Contour")
 
@@ -2565,6 +2690,7 @@ class MatchResolutionGui(QMainWindow):
                 font-weight: bold;
             }
         """)
+        self._enable_table_hover_highlight(self.impedance_table_view)
         self.impedance_tab = self.create_table_page(self.impedance_table_view, impedance_toolbar)
         self.tabs.addTab(self.impedance_tab, "Impedance")
 
@@ -2616,6 +2742,7 @@ class MatchResolutionGui(QMainWindow):
                 font-weight: bold;
             }
         """)
+        self._enable_table_hover_highlight(self.zpar_table_view)
         self.zpar_table_page = self.create_table_page(self.zpar_table_view, zpar_toolbar)
         self.tabs.addTab(self.zpar_table_page, "Zpar")
 
@@ -2667,6 +2794,7 @@ class MatchResolutionGui(QMainWindow):
                 font-weight: bold;
             }
         """)
+        self._enable_table_hover_highlight(self.abcd_table_view)
         self.abcd_table_page = self.create_table_page(self.abcd_table_view, abcd_toolbar)
         self.tabs.addTab(self.abcd_table_page, "ABCD Matrix")
 
@@ -2719,6 +2847,7 @@ class MatchResolutionGui(QMainWindow):
                 font-weight: bold;
             }
         """)
+        self._enable_table_hover_highlight(self.dz_table_view)
         self.dz_table_page = self.create_table_page(self.dz_table_view, dz_toolbar)
 
         dz_plot_frame = QFrame()
@@ -2898,7 +3027,7 @@ class MatchResolutionGui(QMainWindow):
             radio_button.toggled.connect(lambda checked, selected_mode=mode: self._on_smith_mode_changed(selected_mode, checked))
             smith_mode_layout.addWidget(radio_button)
 
-        self.smith_mode_xy_radio.setChecked(True)
+        self.smith_mode_efficiency_radio.setChecked(True)
         smith_mode_layout.addStretch(1)
 
         smith_tools_frame = QFrame()
@@ -3134,6 +3263,7 @@ class MatchResolutionGui(QMainWindow):
                 font-weight: bold;
             }
         """)
+        self._enable_table_hover_highlight(self.reflection_table_view)
         self.reflection_table_page = self.create_table_page(self.reflection_table_view, reflection_toolbar)
 
         reflection_plot_frame = QFrame()
@@ -3223,6 +3353,7 @@ class MatchResolutionGui(QMainWindow):
 
         efficiency_toolbar_layout.addWidget(QLabel("Formula:"))
         self.efficiency_mode_combo = QComboBox()
+        self.efficiency_mode_combo.addItem("ηZ = Re{ZL}|Z21|² / Re{[Z11(ZL+Z22)-Z12Z21](ZL+Z22)*}", "z_single")
         self.efficiency_mode_combo.addItem("ηABCD = PL / Pin", "abcd_power")
         self.efficiency_mode_combo.addItem("|S21|²·(1−|S22|²) / |1−S22²|²", "h_squared")
         self.efficiency_mode_combo.addItem("|S21|²", "s21_squared")
@@ -3262,6 +3393,7 @@ class MatchResolutionGui(QMainWindow):
                 font-weight: bold;
             }
         """)
+        self._enable_table_hover_highlight(self.efficiency_table_view)
         self.efficiency_table_page = self.create_table_page(self.efficiency_table_view, efficiency_toolbar)
 
         efficiency_plot_frame = QFrame()
@@ -3316,7 +3448,13 @@ class MatchResolutionGui(QMainWindow):
             }
         """)
         iout_toolbar_layout = QHBoxLayout(iout_toolbar)
-        iout_toolbar_layout.addWidget(QLabel("Iout formula: Iout = -C·V1 + A·I1"))
+        iout_toolbar_layout.addWidget(QLabel("Iout formula:"))
+        self.iout_formula_combo = QComboBox()
+        self.iout_formula_combo.addItem("Formula 1: Iout = -C·V1 + A·I1", "abcd")
+        self.iout_formula_combo.addItem("Formula 2: Iout = Z21·V1 / DZ", "z_formula")
+        self.iout_formula_combo.setCurrentIndex(1)
+        self.iout_formula_combo.currentTextChanged.connect(self.refresh_iout_table)
+        iout_toolbar_layout.addWidget(self.iout_formula_combo)
         iout_toolbar_layout.addSpacing(16)
         iout_toolbar_layout.addWidget(QLabel("Input power (W):"))
         self.iout_power_edit = QLineEdit("100")
@@ -3356,21 +3494,81 @@ class MatchResolutionGui(QMainWindow):
                 font-weight: bold;
             }
         """)
+        self._enable_table_hover_highlight(self.iout_table_view)
         self.iout_table_page = self.create_table_page(self.iout_table_view, iout_toolbar)
         self.iout_tab = QWidget()
         iout_layout = QVBoxLayout(self.iout_tab)
         iout_layout.addWidget(self.iout_table_page)
 
+        vpp_toolbar = QFrame()
+        vpp_toolbar.setStyleSheet("""
+            QFrame {
+                background-color: #E0F2F1;
+                border-radius: 10px;
+                padding: 8px;
+            }
+        """)
+        vpp_toolbar_layout = QHBoxLayout(vpp_toolbar)
+        vpp_toolbar_layout.addWidget(QLabel("Vpp formula: Vpp = 2√2·Vrms, Vrms = ZL·Z21·V1 / DZ"))
+        vpp_toolbar_layout.addSpacing(16)
+        vpp_toolbar_layout.addWidget(QLabel("Input power (W):"))
+        self.vpp_power_edit = QLineEdit("100")
+        self.vpp_power_edit.setFixedWidth(90)
+        self.vpp_power_edit.setValidator(QDoubleValidator(0.0, 1e12, 6))
+        self.vpp_power_edit.editingFinished.connect(self.refresh_vpp_table)
+        vpp_toolbar_layout.addWidget(self.vpp_power_edit)
+        vpp_toolbar_layout.addWidget(QLabel("Input impedance: 50Ω"))
+        self.vpp_cell_label = QLabel("Click a cell to see the value here.")
+        self.vpp_cell_label.setStyleSheet("""
+            QLabel {
+                color: #004D40;
+                background-color: #B2DFDB;
+                border: 1px solid #26A69A;
+                border-radius: 8px;
+                padding: 6px 10px;
+                font-weight: bold;
+            }
+        """)
+        vpp_toolbar_layout.addWidget(self.vpp_cell_label, stretch=1)
+        vpp_toolbar_layout.addStretch(1)
+
+        self.vpp_table_view = QTableView()
+        self.vpp_table_view.setAlternatingRowColors(False)
+        self.vpp_table_view.setMinimumHeight(240)
+        self.vpp_table_view.setStyleSheet("""
+            QTableView {
+                background-color: white;
+                gridline-color: #80CBC4;
+                font-size: 12px;
+            }
+            QHeaderView::section {
+                background-color: #00897B;
+                color: white;
+                padding: 4px;
+                border: 1px solid #26A69A;
+                font-weight: bold;
+            }
+        """)
+        self._enable_table_hover_highlight(self.vpp_table_view)
+        self.vpp_table_page = self.create_table_page(self.vpp_table_view, vpp_toolbar)
+        self.vpp_tab = QWidget()
+        vpp_layout = QVBoxLayout(self.vpp_tab)
+        vpp_layout.addWidget(self.vpp_table_page)
+        self.derive_eta_formula_tab = self._build_derive_eta_formula_tab()
+
         self.tabs.addTab(self.component_tab, "Component")
         self.tabs.addTab(self.reflection_tab, "Reflect Coefficient")
         self.tabs.addTab(self.efficiency_tab, "Efficiency")
         self.tabs.addTab(self.iout_tab, "Iout")
+        self.tabs.addTab(self.vpp_tab, "Vpp")
+        self.tabs.addTab(self.derive_eta_formula_tab, "Derive η formula")
+        self.tabs.setCurrentWidget(self.smith_tab)
         self._startup_status("Preparing Smith chart and plots...", 75)
 
         main_layout.addWidget(self.tabs, stretch=1)
 
         note = QLabel(
-            "Note: Display tab shows the converted row table. X-Y Table shows the grid view for the selected S-parameter. Zpar shows the converted Z-parameters. ABCD Matrix shows the converted ABCD terms. dZ shows delta impedance for S22. Reflect Coefficient tab shows delta-Γ resolution from X-Y data. Efficiency tab lets you switch between ηABCD = PL / Pin (default), |S21|²·(1−|S22|²)/|1−S22²|², |S21|², and ηoverall = (1 - |S11|²) × |S21|². Iout tab computes Iout = -C·V1 + A·I1 with user-set Pin (default 100W) and Zin = 50Ω. Smith Chart supports X-Y Table, dZ, dΓ, Efficiency coloring modes, manual R/X points, ZL search by C1/C2, and one-click demo plotting."
+            "Note: Display tab shows the converted row table. X-Y Table shows the grid view for the selected S-parameter. Zpar shows the converted Z-parameters. ABCD Matrix shows the converted ABCD terms. dZ shows delta impedance for S22. Reflect Coefficient tab shows delta-Γ resolution from X-Y data. Efficiency tab provides five formulas with default ηZ = Re{ZL}|Z21|² / Re{[Z11(ZL+Z22)-Z12Z21](ZL+Z22)*}. Iout tab provides Formula 1 (-C·V1 + A·I1) and Formula 2 (Z21·V1 / DZ, default), with user-set Pin (default 100W) and Zin = 50Ω. Vpp tab computes Vpp = 2√2·Vrms where Vrms = ZL·Z21·V1 / DZ. Smith Chart defaults to Efficiency mode and supports X-Y Table, dZ, dΓ, Efficiency coloring, Contour, P/M, manual R/X points, ZL search by C1/C2, and one-click demo plotting."
         )
         note.setAlignment(Qt.AlignCenter)
         note.setStyleSheet("font-size: 13px; color: #607D8B; padding: 6px;")
@@ -3724,6 +3922,76 @@ class MatchResolutionGui(QMainWindow):
 
         layout.addWidget(table_view, stretch=1)
         return page
+
+    def _enable_table_hover_highlight(self, table_view: QTableView):
+        table_view.setMouseTracking(True)
+        table_view.viewport().setMouseTracking(True)
+        hover_rule = "QTableView::item:hover { background-color: #BBDEFB; color: #0D47A1; }"
+        style = table_view.styleSheet()
+        if hover_rule not in style:
+            table_view.setStyleSheet(f"{style}\n{hover_rule}")
+
+    def _build_derive_eta_formula_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(16, 16, 16, 16)
+
+        title = QLabel("Derive η formula")
+        title.setStyleSheet("font-size: 18px; font-weight: bold; color: #37474F;")
+        layout.addWidget(title)
+
+        content = QLabel(
+            "How to derive simple term of η formula?\n\n"
+            "Single Z-Parameter Formula for Match Efficiency\n\n"
+            "1. Starting definitions\n"
+            "[V1 V2]^T = [[Z11 Z12][Z21 Z22]] [I1 I2]^T\n"
+            "Both I1 and I2 flow into the two-port network.\n"
+            "Define IL flowing out of Match into load:\n"
+            "I2 = -IL,  V2 = ZL*IL\n\n"
+            "2. ABCD-based efficiency equation\n"
+            "[V1 I1]^T = [[A B][C D]] [V2 IL]^T\n"
+            "With V2 = ZL*IL:\n"
+            "V1 = (A*ZL + B)*IL\n"
+            "I1 = (C*ZL + D)*IL\n"
+            "Pin = Re{V1*conj(I1)} = Re{(A*ZL + B)*(C*ZL + D)*}|IL|^2\n"
+            "PL = Re{ZL}|IL|^2\n"
+            "ηMatch = Re{ZL} / Re{(A*ZL + B)*(C*ZL + D)*}\n\n"
+            "3. Substitute Z-parameters into ABCD equation\n"
+            "A = Z11/Z21\n"
+            "B = (Z11*Z22 - Z12*Z21)/Z21\n"
+            "C = 1/Z21\n"
+            "D = Z22/Z21\n"
+            "Let ΔZ = Z11*Z22 - Z12*Z21\n"
+            "Then:\n"
+            "A*ZL + B = (Z11*ZL + ΔZ)/Z21\n"
+            "C*ZL + D = (ZL + Z22)/Z21\n\n"
+            "4. Final single formula\n"
+            "ηMatch = Re{ZL}|Z21|^2 / Re{(Z11*ZL + Z11*Z22 - Z12*Z21)*(ZL + Z22)*}\n"
+            "Recommended implementation form:\n"
+            "ηMatch = Re{ZL}|Z21|^2 / Re{[Z11*(ZL + Z22) - Z12*Z21]*(ZL + Z22)*}\n"
+            "ηMatch(%) = 100 * Re{ZL}|Z21|^2 / Re{[Z11*(ZL + Z22) - Z12*Z21]*(ZL + Z22)*}\n\n"
+            "5. Physical meaning behind the formula\n"
+            "From V2 = Z21*I1 + Z22*I2, with I2 = -IL and V2 = ZL*IL:\n"
+            "I1 = (ZL + Z22)/Z21 * IL\n"
+            "V1 = Z11*I1 - Z12*IL\n"
+            "V1 = [Z11*(ZL + Z22) - Z12*Z21]/Z21 * IL\n"
+            "Efficiency follows from ηMatch = Re{V2*conj(IL)} / Re{V1*conj(I1)}."
+        )
+        content.setWordWrap(True)
+        content.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        content.setStyleSheet(
+            "QLabel { background-color: #FAFAFA; border: 1px solid #CFD8DC; "
+            "border-radius: 8px; padding: 12px; font-size: 13px; color: #263238; }"
+        )
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setWidget(content)
+        layout.addWidget(scroll, stretch=1)
+
+        return tab
 
     def _create_frozen_overlay_view(self, parent_view: QTableView) -> QTableView:
         overlay_view = QTableView(parent_view)
@@ -4249,8 +4517,13 @@ class MatchResolutionGui(QMainWindow):
             QMessageBox.warning(self, "Input Error", "Input power must be greater than 0 W.")
             return
 
+        self.current_iout_mode = self.iout_formula_combo.currentData()
         self.input_power_watts = input_power
-        self.df_iout_display = build_iout_display_table(self.df_all, self.input_power_watts)
+        self.df_iout_display = build_iout_display_table(
+            self.df_all,
+            self.input_power_watts,
+            self.current_iout_mode,
+        )
 
         self.iout_table_model = PandasTableModel(self.df_iout_display)
         self.iout_table_view.setModel(self.iout_table_model)
@@ -4266,6 +4539,37 @@ class MatchResolutionGui(QMainWindow):
             selection_model.currentChanged.connect(self.update_iout_cell_label)
         self.iout_cell_label.setText("Click a cell to see the value here.")
         self._apply_freeze_panes(self.iout_table_view, freeze_rows=3, freeze_cols=3)
+
+    def refresh_vpp_table(self):
+        if self.df_all is None or self.df_all.empty:
+            return
+
+        try:
+            input_power = float(self.vpp_power_edit.text().strip() or "100")
+        except ValueError:
+            QMessageBox.warning(self, "Input Error", "Please enter a numeric input power in watts.")
+            return
+        if input_power <= 0:
+            QMessageBox.warning(self, "Input Error", "Input power must be greater than 0 W.")
+            return
+
+        self.vpp_power_watts = input_power
+        self.df_vpp_display = build_vpp_display_table(self.df_all, self.vpp_power_watts)
+
+        self.vpp_table_model = PandasTableModel(self.df_vpp_display)
+        self.vpp_table_view.setModel(self.vpp_table_model)
+        self.vpp_table_view.horizontalHeader().setVisible(False)
+        self.vpp_table_view.verticalHeader().setVisible(False)
+        self.vpp_table_view.horizontalHeader().setSectionResizeMode(QHeaderView.Fixed)
+        self.vpp_table_view.horizontalHeader().setDefaultSectionSize(96)
+        self.vpp_table_view.verticalHeader().setDefaultSectionSize(24)
+        self.vpp_table_view.setSelectionBehavior(QTableView.SelectItems)
+        self.vpp_table_view.setSelectionMode(QTableView.SingleSelection)
+        selection_model = self.vpp_table_view.selectionModel()
+        if selection_model is not None:
+            selection_model.currentChanged.connect(self.update_vpp_cell_label)
+        self.vpp_cell_label.setText("Click a cell to see the value here.")
+        self._apply_freeze_panes(self.vpp_table_view, freeze_rows=3, freeze_cols=3)
 
     def update_efficiency_cell_label(self, current, previous):
         if not current.isValid() or self.df_efficiency_display is None:
@@ -4300,6 +4604,23 @@ class MatchResolutionGui(QMainWindow):
             self.iout_cell_label.setText(f"Row {row + 1}, Col {column + 1}: empty")
         else:
             self.iout_cell_label.setText(f"Row {row + 1}, Col {column + 1}: {value}")
+
+    def update_vpp_cell_label(self, current, previous):
+        if not current.isValid() or self.df_vpp_display is None:
+            self.vpp_cell_label.setText("Click a cell to see the value here.")
+            return
+
+        row = current.row()
+        column = current.column()
+        if row >= len(self.df_vpp_display.index) or column >= len(self.df_vpp_display.columns):
+            self.vpp_cell_label.setText("Click a cell to see the value here.")
+            return
+
+        value = self.df_vpp_display.iat[row, column]
+        if value == "":
+            self.vpp_cell_label.setText(f"Row {row + 1}, Col {column + 1}: empty")
+        else:
+            self.vpp_cell_label.setText(f"Row {row + 1}, Col {column + 1}: {value}")
 
     def _on_efficiency_threshold_changed(self):
         if self.df_all is not None and not self.df_all.empty:
@@ -5331,6 +5652,7 @@ class MatchResolutionGui(QMainWindow):
             self.refresh_reflection_table()
             self.refresh_efficiency_table()
             self.refresh_iout_table()
+            self.refresh_vpp_table()
             self.smith_search_result = None
             self.zl_search_result_label.setText("ZL search result will appear here.")
             self.refresh_smith_chart()
@@ -5372,7 +5694,8 @@ class MatchResolutionGui(QMainWindow):
                 f"dZ tab uses {self.current_dz_parameter}.\n"
                 f"Reflect Coefficient tab uses {self.current_reflection_parameter} {self.current_reflection_mode}.\n"
                 f"Efficiency tab uses {self.efficiency_mode_combo.currentText()}.\n"
-                f"Iout tab uses Pin = {self.input_power_watts:.4g} W, Zin = 50Ω.\n"
+                f"Iout tab uses {self.iout_formula_combo.currentText()}, Pin = {self.input_power_watts:.4g} W, Zin = 50Ω.\n"
+                f"Vpp tab uses Pin = {self.vpp_power_watts:.4g} W, Zin = 50Ω.\n"
                 f"Contour tab uses {self.current_contour_parameter}.\n"
                 f"Zpar tab uses {self.current_zpar_parameter}.\n"
                 f"ABCD Matrix tab uses {self.current_abcd_parameter}.\n"
@@ -5410,6 +5733,8 @@ class MatchResolutionGui(QMainWindow):
             default_name = base_name + f"_{efficiency_suffix}_efficiency_table.csv"
         elif current_tab == "Iout" and self.df_iout_display is not None:
             default_name = base_name + f"_pin_{self.input_power_watts:.4g}w_iout_table.csv"
+        elif current_tab == "Vpp" and self.df_vpp_display is not None:
+            default_name = base_name + f"_pin_{self.vpp_power_watts:.4g}w_vpp_table.csv"
         elif current_tab == "Phase Magnitude" and self.df_phase_display is not None:
             default_name = base_name + f"_{self.current_phase_parameter.lower()}_{self.phase_rotation_degrees}deg_phase_table.csv"
         elif current_tab == "Contour" and self.df_contour_display is not None:
@@ -5442,6 +5767,8 @@ class MatchResolutionGui(QMainWindow):
                 self.df_efficiency_display.to_csv(save_path, index=False, header=False)
             elif current_tab == "Iout" and self.df_iout_display is not None:
                 self.df_iout_display.to_csv(save_path, index=False, header=False)
+            elif current_tab == "Vpp" and self.df_vpp_display is not None:
+                self.df_vpp_display.to_csv(save_path, index=False, header=False)
             elif current_tab == "Phase Magnitude" and self.df_phase_display is not None:
                 self.df_phase_display.to_csv(save_path, index=False, header=False)
             elif current_tab == "Contour" and self.df_contour_display is not None:
