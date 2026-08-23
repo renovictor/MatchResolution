@@ -1482,6 +1482,10 @@ def _iout_mode_label(iout_mode):
         return "Formula 1: Iout = -C·V1 + A·I1"
     if iout_mode == "z_formula":
         return "Formula 2: Iout = Z21·V1 / DZ"
+    if iout_mode == "z_formula3":
+        return "Formula 3: Iout = (Z21 / (Z11 + Z22)) × I1"
+    if iout_mode == "z_formula4":
+        return "Formula 4: Iout = (Z11·I1 - V1) / Z12"
     raise ValueError(f"Unknown Iout mode: {iout_mode}")
 
 
@@ -1546,6 +1550,15 @@ def build_iout_display_table(df, input_power_watts, iout_mode="z_formula", z0=DE
             if abs(d_z) < 1e-18:
                 continue
             iout = (z_values["Z21"] * v1) / d_z
+        elif iout_mode == "z_formula3":
+            z_sum = z_values["Z11"] + z_values["Z22"]
+            if abs(z_sum) < 1e-18:
+                continue
+            iout = (z_values["Z21"] / z_sum) * i1
+        elif iout_mode == "z_formula4":
+            if abs(z_values["Z12"]) < 1e-18:
+                continue
+            iout = (z_values["Z11"] * i1 - v1) / z_values["Z12"]
         else:
             raise ValueError(f"Unknown Iout mode: {iout_mode}")
         if not np.isfinite(iout.real) or not np.isfinite(iout.imag):
@@ -1649,6 +1662,97 @@ def build_vpp_display_table(df, input_power_watts, z0=DEFAULT_Z0):
         )
 
     return pd.DataFrame(presentation_rows)
+
+
+def build_phi_out_display_table(df, z0=DEFAULT_Z0):
+    """
+    Build a spreadsheet-like X-Y table showing φ_out (phase angle of load impedance) from:
+      ZL = reflect_to_impedance_value(conj(S22))
+      φ_out = tan⁻¹(XL / RL)
+    where XL is imaginary part and RL is real part of ZL.
+    """
+    required_columns = ["S22_r", "S22_x"]
+    if not all(column in df.columns for column in required_columns):
+        raise ValueError("Missing S-parameter columns required for φ_out calculation.")
+
+    x_values, y_values = extract_xy_axis_values(df)
+    x_lookup = {value: index for index, value in enumerate(x_values)}
+    y_lookup = {value: index for index, value in enumerate(y_values)}
+    x_denominator = max(x_values) if max(x_values) > 0 else 1
+    y_denominator = max(y_values) if max(y_values) > 0 else 1
+
+    grid = [["" for _ in x_values] for _ in y_values]
+    iter_cols = ["X_C1", "Y_C2", "S22_r", "S22_x"]
+    
+    for row in df[iter_cols].itertuples(index=False):
+        x_pos = int(row[0])
+        y_pos = int(row[1])
+        s22 = complex(row[2], row[3])
+
+        gamma_load = np.conj(s22)
+        z_load = reflect_to_impedance_value(gamma_load.real, gamma_load.imag, z0)
+        if z_load is None:
+            continue
+
+        rl = z_load.real
+        xl = z_load.imag
+        
+        if abs(rl) < 1e-18:
+            continue
+        
+        phi_out_rad = np.arctan(xl / rl)
+        phi_out_deg = np.degrees(phi_out_rad)
+        
+        if not np.isfinite(phi_out_deg):
+            continue
+        grid[y_lookup[y_pos]][x_lookup[x_pos]] = f"{phi_out_deg:.6g}"
+
+    presentation_rows = []
+    presentation_rows.append(["", "", "c1 coarse"] + [str(x // 64) for x in x_values])
+    presentation_rows.append(["", "φ_out(°) = tan⁻¹(XL/RL)", "c1 fine"] + [str(x % 64) for x in x_values])
+    presentation_rows.append(["C2 coarse", "c2 fine", "percentage"] + [f"{(x / x_denominator) * 100:.2f}%" for x in x_values])
+
+    for y_index, y_value in enumerate(y_values):
+        presentation_rows.append(
+            [
+                str(y_value // 64),
+                str(y_value % 64),
+                f"{(y_value / y_denominator) * 100:.2f}%",
+                *grid[y_index],
+            ]
+        )
+
+    return pd.DataFrame(presentation_rows)
+
+
+def extract_heatmap_data_from_table(df_display):
+    """
+    Extract numeric heatmap data from a display table.
+    Assumes the first 3 rows are headers and first 3 columns are labels.
+    Returns a 2D numpy array of floats for visualization.
+    """
+    if df_display is None or df_display.empty:
+       return np.array([])
+    
+    data_rows = df_display.iloc[3:, 3:]
+    numeric_data = []
+    
+    for _, row in data_rows.iterrows():
+       numeric_row = []
+       for val in row:
+           try:
+               if isinstance(val, str) and val.strip():
+                   numeric_row.append(float(val))
+               else:
+                   numeric_row.append(np.nan)
+           except (ValueError, TypeError):
+               numeric_row.append(np.nan)
+       if numeric_row:
+           numeric_data.append(numeric_row)
+    
+    if numeric_data:
+       return np.array(numeric_data, dtype=float)
+    return np.array([])
 
 
 def build_smith_chart_plot_data(df, parameter_name):
@@ -2212,6 +2316,7 @@ class MatchResolutionGui(QMainWindow):
         self.input_power_watts = 100.0
         self.df_vpp_display = None
         self.vpp_power_watts = 100.0
+        self.df_phi_out_display = None
         self.smith_manual_points = []
         self.smith_search_result = None
         self.manual_impedance_model = None
@@ -3452,6 +3557,8 @@ class MatchResolutionGui(QMainWindow):
         self.iout_formula_combo = QComboBox()
         self.iout_formula_combo.addItem("Formula 1: Iout = -C·V1 + A·I1", "abcd")
         self.iout_formula_combo.addItem("Formula 2: Iout = Z21·V1 / DZ", "z_formula")
+        self.iout_formula_combo.addItem("Formula 3: Iout = (Z21 / (Z11 + Z22)) × I1", "z_formula3")
+        self.iout_formula_combo.addItem("Formula 4: Iout = (Z11·I1 - V1) / Z12", "z_formula4")
         self.iout_formula_combo.setCurrentIndex(1)
         self.iout_formula_combo.currentTextChanged.connect(self.refresh_iout_table)
         iout_toolbar_layout.addWidget(self.iout_formula_combo)
@@ -3498,7 +3605,15 @@ class MatchResolutionGui(QMainWindow):
         self.iout_table_page = self.create_table_page(self.iout_table_view, iout_toolbar)
         self.iout_tab = QWidget()
         iout_layout = QVBoxLayout(self.iout_tab)
-        iout_layout.addWidget(self.iout_table_page)
+        
+        if _MATPLOTLIB_OK:
+           iout_splitter = QSplitter(Qt.Horizontal)
+           iout_splitter.addWidget(self.iout_table_page)
+           iout_splitter.addWidget(self.iout_heatmap_canvas)
+           iout_splitter.setSizes([800, 200])
+           iout_layout.addWidget(iout_splitter)
+        else:
+           iout_layout.addWidget(self.iout_table_page)
 
         vpp_toolbar = QFrame()
         vpp_toolbar.setStyleSheet("""
@@ -3553,7 +3668,71 @@ class MatchResolutionGui(QMainWindow):
         self.vpp_table_page = self.create_table_page(self.vpp_table_view, vpp_toolbar)
         self.vpp_tab = QWidget()
         vpp_layout = QVBoxLayout(self.vpp_tab)
-        vpp_layout.addWidget(self.vpp_table_page)
+        
+        if _MATPLOTLIB_OK:
+           vpp_splitter = QSplitter(Qt.Horizontal)
+           vpp_splitter.addWidget(self.vpp_table_page)
+           vpp_splitter.addWidget(self.vpp_heatmap_canvas)
+           vpp_splitter.setSizes([800, 200])
+           vpp_layout.addWidget(vpp_splitter)
+        else:
+           vpp_layout.addWidget(self.vpp_table_page)
+        
+        phi_out_toolbar = QFrame()
+        phi_out_toolbar.setStyleSheet("""
+           QFrame {
+               background-color: #F3E5F5;
+               border-radius: 10px;
+               padding: 8px;
+           }
+        """)
+        phi_out_toolbar_layout = QHBoxLayout(phi_out_toolbar)
+        phi_out_toolbar_layout.addWidget(QLabel("φ_out formula: φ_out = tan⁻¹(XL/RL)"))
+        self.phi_out_cell_label = QLabel("Click a cell to see the value here.")
+        self.phi_out_cell_label.setStyleSheet("""
+           QLabel {
+               color: #4A148C;
+               background-color: #E1BEE7;
+               border: 1px solid #CE93D8;
+               border-radius: 8px;
+               padding: 6px 10px;
+               font-weight: bold;
+           }
+        """)
+        phi_out_toolbar_layout.addWidget(self.phi_out_cell_label, stretch=1)
+        phi_out_toolbar_layout.addStretch(1)
+
+        self.phi_out_table_view = QTableView()
+        self.phi_out_table_view.setAlternatingRowColors(False)
+        self.phi_out_table_view.setMinimumHeight(240)
+        self.phi_out_table_view.setStyleSheet("""
+           QTableView {
+               background-color: white;
+               gridline-color: #F5E1FF;
+               font-size: 12px;
+           }
+           QHeaderView::section {
+               background-color: #7B1FA2;
+               color: white;
+               padding: 4px;
+               border: 1px solid #CE93D8;
+               font-weight: bold;
+           }
+        """)
+        self._enable_table_hover_highlight(self.phi_out_table_view)
+        self.phi_out_table_page = self.create_table_page(self.phi_out_table_view, phi_out_toolbar)
+        self.phi_out_tab = QWidget()
+        phi_out_layout = QVBoxLayout(self.phi_out_tab)
+        
+        if _MATPLOTLIB_OK:
+           phi_out_splitter = QSplitter(Qt.Horizontal)
+           phi_out_splitter.addWidget(self.phi_out_table_page)
+           phi_out_splitter.addWidget(self.phi_out_heatmap_canvas)
+           phi_out_splitter.setSizes([800, 200])
+           phi_out_layout.addWidget(phi_out_splitter)
+        else:
+           phi_out_layout.addWidget(self.phi_out_table_page)
+        
         self.derive_eta_formula_tab = self._build_derive_eta_formula_tab()
 
         self.tabs.addTab(self.component_tab, "Component")
@@ -3561,6 +3740,7 @@ class MatchResolutionGui(QMainWindow):
         self.tabs.addTab(self.efficiency_tab, "Efficiency")
         self.tabs.addTab(self.iout_tab, "Iout")
         self.tabs.addTab(self.vpp_tab, "Vpp")
+        self.tabs.addTab(self.phi_out_tab, "φ_out")
         self.tabs.addTab(self.derive_eta_formula_tab, "Derive η formula")
         self.tabs.setCurrentWidget(self.smith_tab)
         self._startup_status("Preparing Smith chart and plots...", 75)
@@ -3568,7 +3748,7 @@ class MatchResolutionGui(QMainWindow):
         main_layout.addWidget(self.tabs, stretch=1)
 
         note = QLabel(
-            "Note: Display tab shows the converted row table. X-Y Table shows the grid view for the selected S-parameter. Zpar shows the converted Z-parameters. ABCD Matrix shows the converted ABCD terms. dZ shows delta impedance for S22. Reflect Coefficient tab shows delta-Γ resolution from X-Y data. Efficiency tab provides five formulas with default ηZ = Re{ZL}|Z21|² / Re{[Z11(ZL+Z22)-Z12Z21](ZL+Z22)*}. Iout tab provides Formula 1 (-C·V1 + A·I1) and Formula 2 (Z21·V1 / DZ, default), with user-set Pin (default 100W) and Zin = 50Ω. Vpp tab computes Vpp = 2√2·Vrms where Vrms = ZL·Z21·V1 / DZ. Smith Chart defaults to Efficiency mode and supports X-Y Table, dZ, dΓ, Efficiency coloring, Contour, P/M, manual R/X points, ZL search by C1/C2, and one-click demo plotting."
+           "Note: Display tab shows the converted row table. X-Y Table shows the grid view for the selected S-parameter. Zpar shows the converted Z-parameters. ABCD Matrix shows the converted ABCD terms. dZ shows delta impedance for S22. Reflect Coefficient tab shows delta-Γ resolution from X-Y data. Efficiency tab provides five formulas with default ηZ = Re{ZL}|Z21|² / Re{[Z11(ZL+Z22)-Z12Z21](ZL+Z22)*}. Iout tab provides Formulas 1-4 with user-set Pin (default 100W) and Zin = 50Ω. Vpp tab computes Vpp = 2√2·Vrms where Vrms = ZL·Z21·V1 / DZ. φ_out tab shows the phase angle φ_out = tan⁻¹(XL/RL) of the load impedance. Smith Chart defaults to Efficiency mode and supports X-Y Table, dZ, dΓ, Efficiency coloring, Contour, P/M, manual R/X points, ZL search by C1/C2, and one-click demo plotting."
         )
         note.setAlignment(Qt.AlignCenter)
         note.setStyleSheet("font-size: 13px; color: #607D8B; padding: 6px;")
@@ -3774,6 +3954,19 @@ class MatchResolutionGui(QMainWindow):
             warn.setAlignment(Qt.AlignCenter)
             warn.setStyleSheet("color: red; font-size: 14px;")
             root.addWidget(warn)
+
+        if _MATPLOTLIB_OK:
+           self.iout_heatmap_figure = Figure(figsize=(5, 6))
+           self.iout_heatmap_canvas = FigureCanvas(self.iout_heatmap_figure)
+           self.iout_heatmap_canvas.setMinimumWidth(200)
+            
+           self.vpp_heatmap_figure = Figure(figsize=(5, 6))
+           self.vpp_heatmap_canvas = FigureCanvas(self.vpp_heatmap_figure)
+           self.vpp_heatmap_canvas.setMinimumWidth(200)
+            
+           self.phi_out_heatmap_figure = Figure(figsize=(5, 6))
+           self.phi_out_heatmap_canvas = FigureCanvas(self.phi_out_heatmap_figure)
+           self.phi_out_heatmap_canvas.setMinimumWidth(200)
 
         root.addStretch(1)
         return outer
@@ -4539,6 +4732,7 @@ class MatchResolutionGui(QMainWindow):
             selection_model.currentChanged.connect(self.update_iout_cell_label)
         self.iout_cell_label.setText("Click a cell to see the value here.")
         self._apply_freeze_panes(self.iout_table_view, freeze_rows=3, freeze_cols=3)
+        self.draw_iout_heatmap()
 
     def refresh_vpp_table(self):
         if self.df_all is None or self.df_all.empty:
@@ -4570,6 +4764,7 @@ class MatchResolutionGui(QMainWindow):
             selection_model.currentChanged.connect(self.update_vpp_cell_label)
         self.vpp_cell_label.setText("Click a cell to see the value here.")
         self._apply_freeze_panes(self.vpp_table_view, freeze_rows=3, freeze_cols=3)
+        self.draw_vpp_heatmap()
 
     def update_efficiency_cell_label(self, current, previous):
         if not current.isValid() or self.df_efficiency_display is None:
@@ -4621,6 +4816,123 @@ class MatchResolutionGui(QMainWindow):
             self.vpp_cell_label.setText(f"Row {row + 1}, Col {column + 1}: empty")
         else:
             self.vpp_cell_label.setText(f"Row {row + 1}, Col {column + 1}: {value}")
+
+    def refresh_phi_out_table(self):
+        if self.df_all is None or self.df_all.empty:
+           return
+
+        self.df_phi_out_display = build_phi_out_display_table(self.df_all)
+
+        self.phi_out_table_model = PandasTableModel(self.df_phi_out_display)
+        self.phi_out_table_view.setModel(self.phi_out_table_model)
+        self.phi_out_table_view.horizontalHeader().setVisible(False)
+        self.phi_out_table_view.verticalHeader().setVisible(False)
+        self.phi_out_table_view.horizontalHeader().setSectionResizeMode(QHeaderView.Fixed)
+        self.phi_out_table_view.horizontalHeader().setDefaultSectionSize(96)
+        self.phi_out_table_view.verticalHeader().setDefaultSectionSize(24)
+        self.phi_out_table_view.setSelectionBehavior(QTableView.SelectItems)
+        self.phi_out_table_view.setSelectionMode(QTableView.SingleSelection)
+        selection_model = self.phi_out_table_view.selectionModel()
+        if selection_model is not None:
+           selection_model.currentChanged.connect(self.update_phi_out_cell_label)
+        self.phi_out_cell_label.setText("Click a cell to see the value here.")
+        self._apply_freeze_panes(self.phi_out_table_view, freeze_rows=3, freeze_cols=3)
+        self.draw_phi_out_heatmap()
+
+    def update_phi_out_cell_label(self, current, previous):
+        if not current.isValid() or self.df_phi_out_display is None:
+           self.phi_out_cell_label.setText("Click a cell to see the value here.")
+           return
+
+        row = current.row()
+        column = current.column()
+        if row >= len(self.df_phi_out_display.index) or column >= len(self.df_phi_out_display.columns):
+           self.phi_out_cell_label.setText("Click a cell to see the value here.")
+           return
+
+        value = self.df_phi_out_display.iat[row, column]
+        if value == "":
+           self.phi_out_cell_label.setText(f"Row {row + 1}, Col {column + 1}: empty")
+        else:
+           self.phi_out_cell_label.setText(f"Row {row + 1}, Col {column + 1}: {value}")
+
+    def draw_iout_heatmap(self):
+        if not _MATPLOTLIB_OK or self.df_iout_display is None or self.df_iout_display.empty:
+           return
+        
+        heatmap_data = extract_heatmap_data_from_table(self.df_iout_display)
+        if heatmap_data.size == 0:
+           return
+        
+        self.iout_heatmap_figure.clear()
+        ax = self.iout_heatmap_figure.add_subplot(111)
+        
+        vmin = np.nanmin(heatmap_data)
+        vmax = np.nanmax(heatmap_data)
+        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
+           return
+        
+        im = ax.imshow(heatmap_data, aspect="auto", origin="lower", cmap="viridis", 
+                     vmin=vmin, vmax=vmax, interpolation="nearest")
+        ax.set_title("Iout Heatmap", fontsize=11, fontweight="bold")
+        ax.set_xlabel("C1", fontsize=9)
+        ax.set_ylabel("C2", fontsize=9)
+        ax.tick_params(labelsize=7)
+        self.iout_heatmap_figure.colorbar(im, ax=ax, pad=0.02)
+        self.iout_heatmap_figure.tight_layout()
+        self.iout_heatmap_canvas.draw()
+
+    def draw_vpp_heatmap(self):
+        if not _MATPLOTLIB_OK or self.df_vpp_display is None or self.df_vpp_display.empty:
+           return
+        
+        heatmap_data = extract_heatmap_data_from_table(self.df_vpp_display)
+        if heatmap_data.size == 0:
+           return
+        
+        self.vpp_heatmap_figure.clear()
+        ax = self.vpp_heatmap_figure.add_subplot(111)
+        
+        vmin = np.nanmin(heatmap_data)
+        vmax = np.nanmax(heatmap_data)
+        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
+           return
+        
+        im = ax.imshow(heatmap_data, aspect="auto", origin="lower", cmap="plasma", 
+                     vmin=vmin, vmax=vmax, interpolation="nearest")
+        ax.set_title("Vpp Heatmap", fontsize=11, fontweight="bold")
+        ax.set_xlabel("C1", fontsize=9)
+        ax.set_ylabel("C2", fontsize=9)
+        ax.tick_params(labelsize=7)
+        self.vpp_heatmap_figure.colorbar(im, ax=ax, pad=0.02)
+        self.vpp_heatmap_figure.tight_layout()
+        self.vpp_heatmap_canvas.draw()
+
+    def draw_phi_out_heatmap(self):
+        if not _MATPLOTLIB_OK or self.df_phi_out_display is None or self.df_phi_out_display.empty:
+           return
+        
+        heatmap_data = extract_heatmap_data_from_table(self.df_phi_out_display)
+        if heatmap_data.size == 0:
+           return
+        
+        self.phi_out_heatmap_figure.clear()
+        ax = self.phi_out_heatmap_figure.add_subplot(111)
+        
+        vmin = np.nanmin(heatmap_data)
+        vmax = np.nanmax(heatmap_data)
+        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
+           return
+        
+        im = ax.imshow(heatmap_data, aspect="auto", origin="lower", cmap="coolwarm", 
+                     vmin=vmin, vmax=vmax, interpolation="nearest")
+        ax.set_title("φ_out Heatmap", fontsize=11, fontweight="bold")
+        ax.set_xlabel("C1", fontsize=9)
+        ax.set_ylabel("C2", fontsize=9)
+        ax.tick_params(labelsize=7)
+        self.phi_out_heatmap_figure.colorbar(im, ax=ax, pad=0.02)
+        self.phi_out_heatmap_figure.tight_layout()
+        self.phi_out_heatmap_canvas.draw()
 
     def _on_efficiency_threshold_changed(self):
         if self.df_all is not None and not self.df_all.empty:
@@ -5653,6 +5965,7 @@ class MatchResolutionGui(QMainWindow):
             self.refresh_efficiency_table()
             self.refresh_iout_table()
             self.refresh_vpp_table()
+            self.refresh_phi_out_table()
             self.smith_search_result = None
             self.zl_search_result_label.setText("ZL search result will appear here.")
             self.refresh_smith_chart()

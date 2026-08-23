@@ -1,5 +1,22 @@
 # Changelog
 
+## V2.0.4
+
+- Added **Formula 3 and Formula 4** to the Iout tab:
+  - **Formula 3**: Iout = (Z21 / (Z11 + Z22)) × I1
+  - **Formula 4**: Iout = (Z11·I1 - V1) / Z12
+  - Both formulas are selectable via the dropdown, joining the existing formulas.
+- Added new **φ_out** tab for load impedance phase angle analysis:
+  - **Formula**: φ_out = tan⁻¹(XL/RL), where XL is the imaginary and RL is the real part of ZL.
+  - Full table display with X-Y grid layout and freeze panes support.
+  - Cell hover display for individual phase angle values.
+- Added **heat map visualizations** on the right side of Iout, Vpp, and φ_out tabs:
+  - Heat maps are displayed using matplotlib with resizable QSplitter layout.
+  - Iout uses **Viridis** colormap, Vpp uses **Plasma**, φ_out uses **Coolwarm**.
+  - Heat maps automatically update when data is refreshed or formulas are changed.
+  - Graceful fallback when matplotlib is not installed.
+- Updated UI note to reflect the expanded Iout formula options and new φ_out tab.
+
 ## V2.0.3
 
 - Added a new default **Efficiency** formula using the single Z-parameter expression:
