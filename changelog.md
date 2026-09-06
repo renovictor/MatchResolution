@@ -1,7 +1,17 @@
 # Changelog
 
+## V2.0.5
+
+- Smith Chart tab: added a **Zoom In** button.
+- Clicking **Zoom In** changes cursor to a crosshair for drag-selection.
+- Each drag-selection opens a new **600x400** zoom window showing only the selected Smith Chart area.
+- Each zoom window includes a top annotation input box for free-form user notes.
+
 ## V2.0.4
 
+- Renamed application display name from **MatchResolution** to **Palantir** while keeping the project/module name unchanged.
+- Updated `build_exe.ps1` executable output naming from `MatchResolution_V<version>.exe` to `Palantir_V<version>.exe`.
+- Updated Windows application identity to use `ASM.Palantir` for taskbar/AppUserModelID consistency.
 - Added **Formula 3 and Formula 4** to the Iout tab:
   - **Formula 3**: Iout = (Z21 / (Z11 + Z22)) × I1
   - **Formula 4**: Iout = (Z11·I1 - V1) / Z12

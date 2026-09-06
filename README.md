@@ -1,8 +1,8 @@
-# MatchResolution User Manual (v2.0.3)
+# Palantir User Manual (v2.0.5)
 
 ## 1. What this app does
 
-MatchResolution converts RF matching datasets into analysis views and charts:
+Palantir converts RF matching datasets into analysis views and charts:
 - **Display** row table
 - **X-Y Table** for selected S-parameter
 - **Phase Magnitude** table with 0-360° rotation
@@ -27,11 +27,12 @@ During conversion, the app can **de-embed cable effects** using Cable1/Cable2 S-
    ```powershell
    python MatchResolution.py
    ```
+   (`MatchResolution.py` is the project entry script name.)
 
 ### EXE mode (Windows)
 Run:
 ```powershell
-.\dist\MatchResolution_V2.0.3.exe
+.\dist\Palantir_V2.0.5.exe
 ```
 
 The app opens **maximized** by default, with **Smith Chart** as the selected startup tab.
@@ -177,4 +178,4 @@ Use:
 .\build_exe.ps1
 ```
 
-This script reads version from `VERSION`, bundles required files (including `VERSION`), and writes EXE to `dist\`.
+This script reads version from `VERSION`, bundles required files (including `VERSION`), and writes EXE to `dist\` as `Palantir_V<version>.exe`.

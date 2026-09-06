@@ -62,6 +62,7 @@ DEFAULT_CABLE_S_PARAMETERS = {
         "s22": 0.000001 + 0.000001j,
     },
 }
+APP_NAME = "Palantir"
 
 np = None
 pd = None
@@ -144,9 +145,9 @@ class StartupSplash(QWidget):
         header_layout.setContentsMargins(22, 18, 22, 18)
         header_layout.setSpacing(4)
 
-        title_label = QLabel("MatchResolution")
+        title_label = QLabel(APP_NAME)
         title_label.setStyleSheet("font-size: 32px; font-weight: bold; color: white;")
-        subtitle_label = QLabel("RF Matching Resolution Tool")
+        subtitle_label = QLabel("RF Matching Network Palantir")
         subtitle_label.setStyleSheet("font-size: 16px; color: #EDE7F6;")
         version_label = QLabel(f"Version {APP_VERSION}")
         version_label.setStyleSheet("font-size: 15px; color: #E1BEE7; font-weight: bold;")
@@ -209,6 +210,73 @@ class StartupSplash(QWidget):
         self.detail_label.setText("Please wait while the application initializes.")
         if progress is not None:
             self.progress_bar.setValue(max(0, min(100, int(progress))))
+
+
+class SmithZoomWindow(QWidget):
+    def __init__(self, title_text):
+        super().__init__()
+        self.setWindowTitle(title_text)
+        self.setFixedSize(600, 400)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        self.annotation_edit = QLineEdit()
+        self.annotation_edit.setPlaceholderText("輸入註解...")
+        layout.addWidget(self.annotation_edit)
+
+        if _MATPLOTLIB_OK:
+            self.figure = Figure(figsize=(6, 4))
+            self.canvas = FigureCanvas(self.figure)
+            layout.addWidget(self.canvas, stretch=1)
+        else:
+            self.figure = None
+            self.canvas = None
+            layout.addWidget(QLabel("matplotlib is not installed.\nRun: pip install matplotlib"))
+
+    def draw_zoom_chart(self, values, manual_values, search_value, x_min, x_max, y_min, y_max, parameter_name):
+        if not _MATPLOTLIB_OK or self.figure is None or self.canvas is None:
+            return
+
+        self.figure.clear()
+        ax = self.figure.add_subplot(111)
+        draw_smith_chart_grid(ax)
+        ax.set_xlim(x_min, x_max)
+        ax.set_ylim(y_min, y_max)
+        ax.set_title(f"Smith Chart Zoom - {parameter_name}", fontsize=10, fontweight="bold")
+        if values.size > 0:
+            ax.scatter(
+                values.real,
+                values.imag,
+                c="#1565C0",
+                s=16,
+                alpha=0.9,
+                edgecolors="none",
+            )
+        if manual_values.size > 0:
+            ax.scatter(
+                manual_values.real,
+                manual_values.imag,
+                marker="*",
+                s=90,
+                c="#D32F2F",
+                edgecolors="white",
+                linewidths=0.8,
+                zorder=5,
+            )
+        if search_value is not None:
+            ax.scatter(
+                [search_value.real],
+                [search_value.imag],
+                marker="D",
+                s=70,
+                c="#000000",
+                edgecolors="white",
+                linewidths=0.8,
+                zorder=6,
+            )
+        self.canvas.draw()
 
 
 def _read_app_version() -> str:
@@ -2285,7 +2353,7 @@ class MatchResolutionGui(QMainWindow):
         super().__init__()
         self.startup_status_callback = startup_status_callback
 
-        self.setWindowTitle(f"RF Matching Resolution Tool {APP_VERSION} - Step 1: CMD to X-Y Table")
+        self.setWindowTitle(f"{APP_NAME} {APP_VERSION} - Step 1: CMD to X-Y Table")
         self.resize(1400, 850)
         self.setWindowState(self.windowState() | Qt.WindowMaximized)
 
@@ -2326,6 +2394,10 @@ class MatchResolutionGui(QMainWindow):
         self.smith_plot_values = np.array([], dtype=complex)
         self.smith_scatter = None
         self.smith_conjugate_enabled = False
+        self.smith_zoom_selection_enabled = False
+        self.smith_zoom_start = None
+        self.smith_zoom_rect = None
+        self.smith_zoom_windows = []
         self.current_smith_mode = "efficiency"
         self.smith_dz_lookup = {}
         self.smith_dgamma_lookup = {}
@@ -2345,7 +2417,7 @@ class MatchResolutionGui(QMainWindow):
         main_widget = QWidget()
         main_layout = QVBoxLayout(main_widget)
 
-        title = QLabel("RF Matching Resolution Tool")
+        title = QLabel("RF Matching Network Palantir")
         title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet("""
             QLabel {
@@ -3074,6 +3146,11 @@ class MatchResolutionGui(QMainWindow):
         self.smith_save_image_button.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-weight: bold; }")
         self.smith_save_image_button.clicked.connect(self._save_smith_chart_image)
         button_stack.addWidget(self.smith_save_image_button)
+        self.smith_zoom_in_button = QPushButton("Zoom In")
+        self.smith_zoom_in_button.setCheckable(True)
+        self.smith_zoom_in_button.setToolTip("Enable drag-zoom selection and open a new 600x400 Smith chart window.")
+        self.smith_zoom_in_button.clicked.connect(self._toggle_smith_zoom_in)
+        button_stack.addWidget(self.smith_zoom_in_button)
         rotation_row = QHBoxLayout()
         rotation_row.addWidget(QLabel("Rotation:"))
         self.phase_rotation_spin = QSpinBox()
@@ -3290,7 +3367,9 @@ class MatchResolutionGui(QMainWindow):
             self.smith_figure = Figure(figsize=(8, 8))
             self.smith_canvas = FigureCanvas(self.smith_figure)
             self.smith_canvas.setMinimumSize(780, 780)
+            self.smith_canvas.mpl_connect("button_press_event", self._on_smith_mouse_press)
             self.smith_canvas.mpl_connect("motion_notify_event", self._on_smith_hover)
+            self.smith_canvas.mpl_connect("button_release_event", self._on_smith_mouse_release)
             right_panel_layout.addWidget(self.smith_canvas)
         else:
             right_panel_layout.addWidget(QLabel("matplotlib is not installed.\nRun: pip install matplotlib"))
@@ -5719,6 +5798,132 @@ class MatchResolutionGui(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Save Failed", str(e))
 
+    def _toggle_smith_zoom_in(self, checked):
+        if not _MATPLOTLIB_OK or not hasattr(self, "smith_canvas"):
+            return
+
+        if not checked:
+            self._exit_smith_zoom_mode(reset_button=False)
+            return
+
+        if self.smith_plot_values.size == 0:
+            QMessageBox.warning(self, "No Plot Data", "Please generate Smith chart points before using Zoom In.")
+            self.smith_zoom_in_button.blockSignals(True)
+            self.smith_zoom_in_button.setChecked(False)
+            self.smith_zoom_in_button.blockSignals(False)
+            return
+
+        self.smith_zoom_selection_enabled = True
+        self.smith_zoom_start = None
+        self.smith_hover_label.setText("Zoom In enabled: drag a rectangle on the Smith chart.")
+        self.smith_canvas.setCursor(Qt.CrossCursor)
+
+    def _exit_smith_zoom_mode(self, reset_button=True):
+        self.smith_zoom_selection_enabled = False
+        self.smith_zoom_start = None
+        if self.smith_zoom_rect is not None:
+            try:
+                self.smith_zoom_rect.remove()
+            except Exception:
+                pass
+            self.smith_zoom_rect = None
+            self.smith_canvas.draw_idle()
+        if hasattr(self, "smith_canvas"):
+            self.smith_canvas.unsetCursor()
+        if reset_button and hasattr(self, "smith_zoom_in_button"):
+            self.smith_zoom_in_button.blockSignals(True)
+            self.smith_zoom_in_button.setChecked(False)
+            self.smith_zoom_in_button.blockSignals(False)
+
+    def _on_smith_mouse_press(self, event):
+        if not self.smith_zoom_selection_enabled:
+            return
+        if event.button != 1 or event.inaxes is None or event.xdata is None or event.ydata is None:
+            return
+
+        self.smith_zoom_start = (float(event.xdata), float(event.ydata))
+        if self.smith_zoom_rect is not None:
+            try:
+                self.smith_zoom_rect.remove()
+            except Exception:
+                pass
+            self.smith_zoom_rect = None
+
+        from matplotlib.patches import Rectangle
+        self.smith_zoom_rect = Rectangle(
+            (self.smith_zoom_start[0], self.smith_zoom_start[1]),
+            0.0,
+            0.0,
+            fill=False,
+            edgecolor="#D32F2F",
+            linewidth=1.2,
+            linestyle="--",
+            zorder=10,
+        )
+        event.inaxes.add_patch(self.smith_zoom_rect)
+        self.smith_canvas.draw_idle()
+
+    def _on_smith_mouse_release(self, event):
+        if not self.smith_zoom_selection_enabled or self.smith_zoom_start is None:
+            return
+
+        if event.button != 1 or event.xdata is None or event.ydata is None:
+            self._exit_smith_zoom_mode()
+            return
+
+        x0, y0 = self.smith_zoom_start
+        x1, y1 = float(event.xdata), float(event.ydata)
+        x_min, x_max = sorted((x0, x1))
+        y_min, y_max = sorted((y0, y1))
+
+        if abs(x_max - x_min) < 1e-6 or abs(y_max - y_min) < 1e-6:
+            self._exit_smith_zoom_mode()
+            return
+
+        self._open_smith_zoom_window(x_min, x_max, y_min, y_max)
+        self._exit_smith_zoom_mode()
+
+    def _open_smith_zoom_window(self, x_min, x_max, y_min, y_max):
+        if self.smith_plot_values.size == 0:
+            return
+
+        values = self.smith_plot_values
+        mask = (
+            (values.real >= x_min) & (values.real <= x_max)
+            & (values.imag >= y_min) & (values.imag <= y_max)
+        )
+        selected_values = values[mask]
+
+        manual_values = np.array([], dtype=complex)
+        if self.smith_manual_points:
+            all_manual_values = np.array([point["gamma"] for point in self.smith_manual_points], dtype=complex)
+            manual_mask = (
+                (all_manual_values.real >= x_min) & (all_manual_values.real <= x_max)
+                & (all_manual_values.imag >= y_min) & (all_manual_values.imag <= y_max)
+            )
+            manual_values = all_manual_values[manual_mask]
+
+        search_value = None
+        if self.smith_search_result is not None:
+            current_search = self.smith_search_result.get("gamma")
+            if current_search is not None:
+                if (x_min <= current_search.real <= x_max) and (y_min <= current_search.imag <= y_max):
+                    search_value = current_search
+
+        zoom_window = SmithZoomWindow("Smith Chart Zoom In")
+        zoom_window.draw_zoom_chart(
+            selected_values,
+            manual_values,
+            search_value,
+            x_min,
+            x_max,
+            y_min,
+            y_max,
+            self.current_smith_parameter,
+        )
+        self.smith_zoom_windows.append(zoom_window)
+        zoom_window.show()
+
     def _format_smith_impedance_text(self, gamma_value):
         z_value = reflect_to_impedance_value(gamma_value.real, gamma_value.imag)
         if z_value is None:
@@ -5748,6 +5953,18 @@ class MatchResolutionGui(QMainWindow):
         return f"C1 {c1_text} | C2 {c2_text} | {gamma_text}{pm_text} | {impedance_text}"
 
     def _on_smith_hover(self, event):
+        if self.smith_zoom_selection_enabled and self.smith_zoom_start is not None and self.smith_zoom_rect is not None:
+            if event.inaxes is None or event.xdata is None or event.ydata is None:
+                return
+            x0, y0 = self.smith_zoom_start
+            x1, y1 = float(event.xdata), float(event.ydata)
+            self.smith_zoom_rect.set_x(min(x0, x1))
+            self.smith_zoom_rect.set_y(min(y0, y1))
+            self.smith_zoom_rect.set_width(abs(x1 - x0))
+            self.smith_zoom_rect.set_height(abs(y1 - y0))
+            self.smith_canvas.draw_idle()
+            return
+
         if not _MATPLOTLIB_OK or self.smith_scatter is None or event.inaxes is None:
             return
 
@@ -6102,9 +6319,10 @@ class MatchResolutionGui(QMainWindow):
 if __name__ == "__main__":
     if sys.platform == "win32":
         import ctypes
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ASM.MatchResolution")
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ASM.Palantir")
 
     app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
     app_icon = load_app_icon()
     app.setWindowIcon(app_icon)
 
