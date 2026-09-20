@@ -1,4 +1,4 @@
-# Palantir User Manual (v2.0.5)
+# Palantir User Manual (v3.0.1)
 
 ## 1. What this app does
 
@@ -32,7 +32,7 @@ During conversion, the app can **de-embed cable effects** using Cable1/Cable2 S-
 ### EXE mode (Windows)
 Run:
 ```powershell
-.\dist\Palantir_V2.0.5.exe
+.\dist\Palantir_V3.0.1.exe
 ```
 
 The app opens **maximized** by default, with **Smith Chart** as the selected startup tab.
@@ -97,13 +97,15 @@ All tabs and plots use these de-embedded S-parameters.
 - **X-Y Table**: grid view by selected S-parameter.
 - **Phase Magnitude**: magnitude/phase table with a 0-360° rotation control on the Smith Chart tab.
 - **Contour**: edge-only grid view and contour Smith mode.
-- **Impedance**: derived impedance table/plot.
+- **Z*out**: derived impedance table/plot from reflection coefficient.
+- **ZL,Γin=0**: derived load impedance table using `ZL = -Z12·Z21/(50 - Z11) - Z22`.
 - **Zpar**: derived `Z11 / Z21 / Z12 / Z22` grid table.
 - **ABCD Matrix**: derived `A / B / C / D` grid table converted from the 2-port matrix.
 - **dZ**: delta-impedance maps.
 - **Reflect Coefficient**: delta-Γ analysis.
-- **Efficiency**: power transmission efficiency table with five selectable formulas:
-  - `ηZ = Re{ZL}|Z21|² / Re{[Z11(ZL+Z22)-Z12Z21](ZL+Z22)*}` **(default)**
+- **Efficiency**: power transmission efficiency table with six selectable formulas:
+  - `ηZ = Re{ZL}|Z21|² / Re{[Z11(ZL+Z22)-Z12Z21](ZL+Z22)*}`
+  - `ηZL,Γin=0 = Re{ZL}|Z21|² / Re{[Z11(ZL+Z22)-Z12Z21](ZL+Z22)*}` **(default)**
   - `ηABCD = PL / Pin` — ABCD-based calculation using `conj(S22)` as the load reflection coefficient
   - `|S21|²·(1−|S22|²) / |1−S22²|²` — transducer gain `G_T`
   - `|S21|²`

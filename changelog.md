@@ -1,5 +1,11 @@
 # Changelog
 
+## V3.0.1
+
+- Added `Z*out` and `ZL,Γin=0` tabs.
+- Added the `zl_gin0` efficiency mode and made it the default.
+- Updated the release label to V3.0.1.
+
 ## V2.0.5
 
 - Smith Chart tab: added a **Zoom In** button.

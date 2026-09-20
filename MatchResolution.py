@@ -1064,6 +1064,18 @@ def format_impedance_text(z_value):
     return f"{z_value.real:.6g}{sign}{abs(z_value.imag):.6g}j"
 
 
+def calculate_zl_gamma_in0_value(z11, z12, z21, z22, z0=DEFAULT_Z0):
+    """Return ZL for the Γin=0 condition using the Z-parameter formula."""
+    if any(pd.isna(value) for value in [z11, z12, z21, z22]):
+        return None
+
+    denom = z0 - z11
+    if abs(denom) < 1e-12:
+        return None
+
+    return -((z12 * z21) / denom) - z22
+
+
 def find_nearest_load_impedance(df, c1_pct, c2_pct, parameter_name="S22", conjugate=False):
     real_col = f"{parameter_name}_r"
     imag_col = f"{parameter_name}_x"
@@ -1185,6 +1197,70 @@ def build_impedance_display_table(df, parameter_name, z0=DEFAULT_Z0):
                 str(y_value % 64),
                 f"{(y_value / y_denominator) * 100:.2f}%",
                 *grid_row,
+            ]
+        )
+
+    return pd.DataFrame(presentation_rows)
+
+
+def build_zl_gin0_display_table(df, z0=DEFAULT_Z0):
+    """Build a spreadsheet-like X-Y table showing ZL for Γin=0."""
+    required_columns = ["S11_r", "S11_x", "S21_r", "S21_x", "S12_r", "S12_x", "S22_r", "S22_x"]
+    if not all(column in df.columns for column in required_columns):
+        raise ValueError("Missing S-parameter columns required for ZL calculation.")
+
+    x_values, y_values = extract_xy_axis_values(df)
+    x_lookup = {value: index for index, value in enumerate(x_values)}
+    y_lookup = {value: index for index, value in enumerate(y_values)}
+    x_denominator = max(x_values) if max(x_values) > 0 else 1
+    y_denominator = max(y_values) if max(y_values) > 0 else 1
+
+    grid = [["" for _ in x_values] for _ in y_values]
+
+    iter_cols = [
+        "X_C1", "Y_C2",
+        "S11_r", "S11_x",
+        "S21_r", "S21_x",
+        "S12_r", "S12_x",
+        "S22_r", "S22_x",
+    ]
+
+    for row in df[iter_cols].itertuples(index=False):
+        x_pos = int(row[0])
+        y_pos = int(row[1])
+        s11 = complex(row[2], row[3])
+        s21 = complex(row[4], row[5])
+        s12 = complex(row[6], row[7])
+        s22 = complex(row[8], row[9])
+
+        z_values = s_to_z_parameter_values(s11, s21, s12, s22, z0)
+        if z_values is None:
+            continue
+
+        z_load = calculate_zl_gamma_in0_value(
+            z_values["Z11"],
+            z_values["Z12"],
+            z_values["Z21"],
+            z_values["Z22"],
+            z0,
+        )
+        if z_load is None:
+            continue
+
+        grid[y_lookup[y_pos]][x_lookup[x_pos]] = format_complex_text(z_load.real, z_load.imag)
+
+    presentation_rows = []
+    presentation_rows.append(["", "", "c1 coarse"] + [str(x // 64) for x in x_values])
+    presentation_rows.append(["", "ZL,Γin=0", "c1 fine"] + [str(x % 64) for x in x_values])
+    presentation_rows.append(["C2 coarse", "c2 fine", "percentage"] + [f"{(x / x_denominator) * 100:.2f}%" for x in x_values])
+
+    for y_index, y_value in enumerate(y_values):
+        presentation_rows.append(
+            [
+                str(y_value // 64),
+                str(y_value % 64),
+                f"{(y_value / y_denominator) * 100:.2f}%",
+                *grid[y_index],
             ]
         )
 
@@ -1371,6 +1447,8 @@ def build_reflection_display_table(df, parameter_name, orientation):
 def _efficiency_mode_label(efficiency_mode):
     if efficiency_mode == "z_single":
         return "ηZ = Re{ZL}|Z21|² / Re{[Z11(ZL+Z22)-Z12Z21](ZL+Z22)*}"
+    if efficiency_mode == "zl_gin0":
+        return "ηZL,Γin=0 = Re{ZL}|Z21|² / Re{[Z11(ZL+Z22)-Z12Z21](ZL+Z22)*}"
     if efficiency_mode == "abcd_power":
         return "ηABCD = PL / Pin"
     if efficiency_mode == "h_squared":
@@ -1386,6 +1464,17 @@ def calculate_efficiency_value(s11, s21, s12, s22, efficiency_mode, z0=DEFAULT_Z
     s11_magnitude = abs(s11)
     s21_magnitude = abs(s21)
 
+    def _calculate_from_load(z_values, z_load):
+        if z_load is None:
+            return None
+        z_sum = z_load + z_values["Z22"]
+        d_z = (z_values["Z11"] * z_sum) - (z_values["Z12"] * z_values["Z21"])
+        denominator = (d_z * np.conj(z_sum)).real
+        numerator = z_load.real * (abs(z_values["Z21"]) ** 2)
+        if not np.isfinite(denominator) or not np.isfinite(numerator) or denominator <= 1e-18:
+            return None
+        return numerator / denominator
+
     if efficiency_mode == "z_single":
         gamma_load = np.conj(s22)
         z_load = reflect_to_impedance_value(gamma_load.real, gamma_load.imag, z0)
@@ -1396,13 +1485,21 @@ def calculate_efficiency_value(s11, s21, s12, s22, efficiency_mode, z0=DEFAULT_Z
         if z_values is None:
             return None
 
-        z_sum = z_load + z_values["Z22"]
-        d_z = (z_values["Z11"] * z_sum) - (z_values["Z12"] * z_values["Z21"])
-        denominator = (d_z * np.conj(z_sum)).real
-        numerator = z_load.real * (abs(z_values["Z21"]) ** 2)
-        if not np.isfinite(denominator) or not np.isfinite(numerator) or denominator <= 1e-18:
+        return _calculate_from_load(z_values, z_load)
+
+    if efficiency_mode == "zl_gin0":
+        z_values = s_to_z_parameter_values(s11, s21, s12, s22, z0)
+        if z_values is None:
             return None
-        return numerator / denominator
+
+        z_load = calculate_zl_gamma_in0_value(
+            z_values["Z11"],
+            z_values["Z12"],
+            z_values["Z21"],
+            z_values["Z22"],
+            z0,
+        )
+        return _calculate_from_load(z_values, z_load)
 
     if efficiency_mode == "abcd_power":
         gamma_load = np.conj(s22)
@@ -1473,7 +1570,7 @@ def build_efficiency_display_table(df, efficiency_mode):
     s22_x_col = "S22_x"
 
     required_cols = [s11_r_col, s11_x_col, s21_r_col, s21_x_col]
-    if efficiency_mode in ("z_single", "abcd_power"):
+    if efficiency_mode in ("z_single", "zl_gin0", "abcd_power"):
         required_cols.extend([s12_r_col, s12_x_col, s22_r_col, s22_x_col])
     elif efficiency_mode == "h_squared":
         required_cols.extend([s22_r_col, s22_x_col])
@@ -1510,7 +1607,7 @@ def build_efficiency_display_table(df, efficiency_mode):
         s22_real = row[8]
         s22_imag = row[9]
         required_values = [s11_real, s11_imag, s21_real, s21_imag]
-        if efficiency_mode in ("z_single", "abcd_power"):
+        if efficiency_mode in ("z_single", "zl_gin0", "abcd_power"):
             required_values.extend([s12_real, s12_imag, s22_real, s22_imag])
         elif efficiency_mode == "h_squared":
             required_values.extend([s22_real, s22_imag])
@@ -1934,11 +2031,12 @@ def build_smith_dgamma_lookup(df, parameter_name, orientation):
     return dgamma_lookup
 
 
-def build_smith_efficiency_lookup(df, efficiency_mode="z_single"):
+def build_smith_efficiency_lookup(df, efficiency_mode="zl_gin0"):
     """
     Build a lookup table for Smith-chart efficiency coloring.
-    Supports five modes:
-      'z_single' : ηZ = Re{ZL}|Z21|² / Re{[Z11(ZL+Z22)-Z12Z21](ZL+Z22)*} (default)
+    Supports six modes:
+      'z_single' : ηZ = Re{ZL}|Z21|² / Re{[Z11(ZL+Z22)-Z12Z21](ZL+Z22)*}
+      'zl_gin0'  : ηZL,Γin=0 = Re{ZL}|Z21|² / Re{[Z11(ZL+Z22)-Z12Z21](ZL+Z22)*} (default)
       'abcd_power': ηABCD = PL / Pin
       'h_squared' : |S21|²·(1−|S22|²) / |1−S22²|²
       'overall'   : (1 - |S11|²) × |S21|²
@@ -1954,7 +2052,7 @@ def build_smith_efficiency_lookup(df, efficiency_mode="z_single"):
     s22_x_col = "S22_x"
 
     required_cols = [s11_r_col, s11_x_col, s21_r_col, s21_x_col]
-    if efficiency_mode in ("z_single", "abcd_power"):
+    if efficiency_mode in ("z_single", "zl_gin0", "abcd_power"):
         required_cols.extend([s12_r_col, s12_x_col, s22_r_col, s22_x_col])
     elif efficiency_mode == "h_squared":
         required_cols.extend([s22_r_col, s22_x_col])
@@ -1983,7 +2081,7 @@ def build_smith_efficiency_lookup(df, efficiency_mode="z_single"):
         s22_real = row[8]
         s22_imag = row[9]
         required_values = [s11_real, s11_imag, s21_real, s21_imag]
-        if efficiency_mode in ("z_single", "abcd_power"):
+        if efficiency_mode in ("z_single", "zl_gin0", "abcd_power"):
             required_values.extend([s12_real, s12_imag, s22_real, s22_imag])
         elif efficiency_mode == "h_squared":
             required_values.extend([s22_real, s22_imag])
@@ -2368,6 +2466,7 @@ class MatchResolutionGui(QMainWindow):
         self.current_contour_parameter = "S22"
         self.df_impedance_display = None
         self.current_impedance_parameter = "S22"
+        self.df_zl_display = None
         self.df_zpar_display = None
         self.current_zpar_parameter = "Z22"
         self.df_abcd_display = None
@@ -2378,7 +2477,7 @@ class MatchResolutionGui(QMainWindow):
         self.current_reflection_parameter = "S22"
         self.current_reflection_mode = "horizontal"
         self.df_efficiency_display = None
-        self.current_efficiency_mode = "z_single"
+        self.current_efficiency_mode = "zl_gin0"
         self.df_iout_display = None
         self.current_iout_mode = "z_formula"
         self.input_power_watts = 100.0
@@ -2836,7 +2935,7 @@ class MatchResolutionGui(QMainWindow):
         self.impedance_parameter_combo.currentTextChanged.connect(self.refresh_impedance_table)
         impedance_toolbar_layout.addWidget(self.impedance_parameter_combo)
 
-        impedance_toolbar_layout.addWidget(QLabel("Impedance Z = 50Ω × (1+Γ)/(1−Γ), Γ = reflection coefficient"))
+        impedance_toolbar_layout.addWidget(QLabel("Z*out = 50Ω × (1+Γ)/(1−Γ), Γ = reflection coefficient"))
         self.impedance_cell_label = QLabel("Click a cell to see the value here.")
         self.impedance_cell_label.setStyleSheet("""
             QLabel {
@@ -2869,7 +2968,51 @@ class MatchResolutionGui(QMainWindow):
         """)
         self._enable_table_hover_highlight(self.impedance_table_view)
         self.impedance_tab = self.create_table_page(self.impedance_table_view, impedance_toolbar)
-        self.tabs.addTab(self.impedance_tab, "Impedance")
+        self.tabs.addTab(self.impedance_tab, "Z*out")
+
+        zl_toolbar = QFrame()
+        zl_toolbar.setStyleSheet("""
+            QFrame {
+                background-color: #E8F5E9;
+                border-radius: 10px;
+                padding: 8px;
+            }
+        """)
+        zl_toolbar_layout = QHBoxLayout(zl_toolbar)
+        zl_toolbar_layout.addWidget(QLabel("ZL,Γin=0 = -Z12·Z21/(50Ω - Z11) - Z22"))
+        self.zl_cell_label = QLabel("Click a cell to see the value here.")
+        self.zl_cell_label.setStyleSheet("""
+            QLabel {
+                color: #1B5E20;
+                background-color: #F1F8E9;
+                border: 1px solid #558B2F;
+                border-radius: 8px;
+                padding: 6px 10px;
+                font-weight: bold;
+            }
+        """)
+        zl_toolbar_layout.addWidget(self.zl_cell_label, stretch=1)
+        zl_toolbar_layout.addStretch(1)
+
+        self.zl_table_view = QTableView()
+        self.zl_table_view.setAlternatingRowColors(False)
+        self.zl_table_view.setStyleSheet("""
+            QTableView {
+                background-color: white;
+                gridline-color: #90A4AE;
+                font-size: 12px;
+            }
+            QHeaderView::section {
+                background-color: #2E7D32;
+                color: white;
+                padding: 4px;
+                border: 1px solid #388E3C;
+                font-weight: bold;
+            }
+        """)
+        self._enable_table_hover_highlight(self.zl_table_view)
+        self.zl_table_page = self.create_table_page(self.zl_table_view, zl_toolbar)
+        self.tabs.addTab(self.zl_table_page, "ZL,Γin=0")
 
         zpar_toolbar = QFrame()
         zpar_toolbar.setStyleSheet("""
@@ -3538,11 +3681,12 @@ class MatchResolutionGui(QMainWindow):
         efficiency_toolbar_layout.addWidget(QLabel("Formula:"))
         self.efficiency_mode_combo = QComboBox()
         self.efficiency_mode_combo.addItem("ηZ = Re{ZL}|Z21|² / Re{[Z11(ZL+Z22)-Z12Z21](ZL+Z22)*}", "z_single")
+        self.efficiency_mode_combo.addItem("ηZL,Γin=0 = Re{ZL}|Z21|² / Re{[Z11(ZL+Z22)-Z12Z21](ZL+Z22)*}", "zl_gin0")
         self.efficiency_mode_combo.addItem("ηABCD = PL / Pin", "abcd_power")
         self.efficiency_mode_combo.addItem("|S21|²·(1−|S22|²) / |1−S22²|²", "h_squared")
         self.efficiency_mode_combo.addItem("|S21|²", "s21_squared")
         self.efficiency_mode_combo.addItem("ηoverall = (1 - |S11|²) × |S21|²", "overall")
-        self.efficiency_mode_combo.setCurrentIndex(0)
+        self.efficiency_mode_combo.setCurrentIndex(1)
         self.efficiency_mode_combo.currentTextChanged.connect(lambda *_: self.refresh_efficiency_table())
         efficiency_toolbar_layout.addWidget(self.efficiency_mode_combo)
         efficiency_toolbar_layout.addWidget(QLabel("Power transmission efficiency table"))
@@ -3827,7 +3971,7 @@ class MatchResolutionGui(QMainWindow):
         main_layout.addWidget(self.tabs, stretch=1)
 
         note = QLabel(
-           "Note: Display tab shows the converted row table. X-Y Table shows the grid view for the selected S-parameter. Zpar shows the converted Z-parameters. ABCD Matrix shows the converted ABCD terms. dZ shows delta impedance for S22. Reflect Coefficient tab shows delta-Γ resolution from X-Y data. Efficiency tab provides five formulas with default ηZ = Re{ZL}|Z21|² / Re{[Z11(ZL+Z22)-Z12Z21](ZL+Z22)*}. Iout tab provides Formulas 1-4 with user-set Pin (default 100W) and Zin = 50Ω. Vpp tab computes Vpp = 2√2·Vrms where Vrms = ZL·Z21·V1 / DZ. φ_out tab shows the phase angle φ_out = tan⁻¹(XL/RL) of the load impedance. Smith Chart defaults to Efficiency mode and supports X-Y Table, dZ, dΓ, Efficiency coloring, Contour, P/M, manual R/X points, ZL search by C1/C2, and one-click demo plotting."
+           "Note: Display tab shows the converted row table. X-Y Table shows the grid view for the selected S-parameter. Z*out shows the reflection-coefficient impedance Z = 50Ω × (1+Γ)/(1−Γ). ZL,Γin=0 shows ZL = -Z12·Z21/(50Ω - Z11) - Z22. Zpar shows the converted Z-parameters. ABCD Matrix shows the converted ABCD terms. dZ shows delta impedance for S22. Reflect Coefficient tab shows delta-Γ resolution from X-Y data. Efficiency tab provides six formulas with default ηZL,Γin=0 = Re{ZL}|Z21|² / Re{[Z11(ZL+Z22)-Z12Z21](ZL+Z22)*}. Iout tab provides Formulas 1-4 with user-set Pin (default 100W) and Zin = 50Ω. Vpp tab computes Vpp = 2√2·Vrms where Vrms = ZL·Z21·V1 / DZ. φ_out tab shows the phase angle φ_out = tan⁻¹(XL/RL) of the load impedance. Smith Chart defaults to Efficiency mode and supports X-Y Table, dZ, dΓ, Efficiency coloring, Contour, P/M, manual R/X points, ZL search by C1/C2, and one-click demo plotting."
         )
         note.setAlignment(Qt.AlignCenter)
         note.setStyleSheet("font-size: 13px; color: #607D8B; padding: 6px;")
@@ -4700,6 +4844,44 @@ class MatchResolutionGui(QMainWindow):
             self.impedance_cell_label.setText(f"Row {row + 1}, Col {column + 1}: empty")
         else:
             self.impedance_cell_label.setText(f"Row {row + 1}, Col {column + 1}: {value}")
+
+    def refresh_zl_table(self):
+        if self.df_all is None or self.df_all.empty:
+            return
+
+        self.df_zl_display = build_zl_gin0_display_table(self.df_all)
+
+        self.zl_table_model = PandasTableModel(self.df_zl_display)
+        self.zl_table_view.setModel(self.zl_table_model)
+        self.zl_table_view.horizontalHeader().setVisible(False)
+        self.zl_table_view.verticalHeader().setVisible(False)
+        self.zl_table_view.horizontalHeader().setSectionResizeMode(QHeaderView.Fixed)
+        self.zl_table_view.horizontalHeader().setDefaultSectionSize(80)
+        self.zl_table_view.verticalHeader().setDefaultSectionSize(24)
+        self.zl_table_view.setSelectionBehavior(QTableView.SelectItems)
+        self.zl_table_view.setSelectionMode(QTableView.SingleSelection)
+        selection_model = self.zl_table_view.selectionModel()
+        if selection_model is not None:
+            selection_model.currentChanged.connect(self.update_zl_cell_label)
+        self.zl_cell_label.setText("Click a cell to see the value here.")
+        self._apply_freeze_panes(self.zl_table_view, freeze_rows=3, freeze_cols=3)
+
+    def update_zl_cell_label(self, current, previous):
+        if not current.isValid() or self.df_zl_display is None:
+            self.zl_cell_label.setText("Click a cell to see the value here.")
+            return
+
+        row = current.row()
+        column = current.column()
+        if row >= len(self.df_zl_display.index) or column >= len(self.df_zl_display.columns):
+            self.zl_cell_label.setText("Click a cell to see the value here.")
+            return
+
+        value = self.df_zl_display.iat[row, column]
+        if value == "":
+            self.zl_cell_label.setText(f"Row {row + 1}, Col {column + 1}: empty")
+        else:
+            self.zl_cell_label.setText(f"Row {row + 1}, Col {column + 1}: {value}")
 
     def refresh_reflection_table(self):
         if self.df_all is None or self.df_all.empty:
@@ -6175,6 +6357,7 @@ class MatchResolutionGui(QMainWindow):
             self.refresh_phase_table()
             self.refresh_contour_table()
             self.refresh_impedance_table()
+            self.refresh_zl_table()
             self.refresh_zpar_table()
             self.refresh_abcd_table()
             self.refresh_dz_table()
@@ -6220,7 +6403,8 @@ class MatchResolutionGui(QMainWindow):
                 f"Cable de-embed source: {self.current_cable_source}\n"
                 f"X-Y tab uses {self.current_xy_parameter}.\n"
                 f"Phase tab uses {self.current_phase_parameter} at {self.phase_rotation_degrees}°.\n"
-                f"Impedance tab uses {self.current_impedance_parameter}.\n"
+                f"Z*out tab uses {self.current_impedance_parameter}.\n"
+                f"ZL,Γin=0 tab uses ZL = -Z12·Z21/(50Ω - Z11) - Z22.\n"
                 f"dZ tab uses {self.current_dz_parameter}.\n"
                 f"Reflect Coefficient tab uses {self.current_reflection_parameter} {self.current_reflection_mode}.\n"
                 f"Efficiency tab uses {self.efficiency_mode_combo.currentText()}.\n"
@@ -6245,8 +6429,10 @@ class MatchResolutionGui(QMainWindow):
         base_name = os.path.splitext(os.path.basename(input_path))[0]
         current_tab = self.tabs.tabText(self.tabs.currentIndex())
 
-        if current_tab == "Impedance" and self.df_impedance_display is not None:
-            default_name = base_name + f"_{self.current_impedance_parameter.lower()}_impedance_table.csv"
+        if current_tab == "Z*out" and self.df_impedance_display is not None:
+            default_name = base_name + f"_{self.current_impedance_parameter.lower()}_zout_table.csv"
+        elif current_tab == "ZL,Γin=0" and self.df_zl_display is not None:
+            default_name = base_name + "_zl_gin0_table.csv"
         elif current_tab == "Zpar" and self.df_zpar_display is not None:
             default_name = base_name + f"_{self.current_zpar_parameter.lower()}_zpar_table.csv"
         elif current_tab == "ABCD Matrix" and self.df_abcd_display is not None:
@@ -6283,8 +6469,10 @@ class MatchResolutionGui(QMainWindow):
             return
 
         try:
-            if current_tab == "Impedance" and self.df_impedance_display is not None:
+            if current_tab == "Z*out" and self.df_impedance_display is not None:
                 self.df_impedance_display.to_csv(save_path, index=False, header=False)
+            elif current_tab == "ZL,Γin=0" and self.df_zl_display is not None:
+                self.df_zl_display.to_csv(save_path, index=False, header=False)
             elif current_tab == "Zpar" and self.df_zpar_display is not None:
                 self.df_zpar_display.to_csv(save_path, index=False, header=False)
             elif current_tab == "ABCD Matrix" and self.df_abcd_display is not None:

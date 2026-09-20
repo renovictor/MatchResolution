@@ -2,48 +2,58 @@
 
 ## Overview
 
-The Efficiency feature adds power transmission efficiency analysis to the RF Matching Resolution Tool. This document explains the complete implementation of the Efficiency tab and Smith Chart coloring mode, including the core formula, data structures, UI components, and rendering pipeline.
+The Efficiency feature adds power transmission efficiency analysis to the RF Matching Resolution Tool. This document explains the complete implementation of the Efficiency tab and Smith Chart coloring mode, including all implemented formulas, data structures, UI components, and rendering pipeline.
 
 ## Efficiency Formula
 
-### Core Calculation
+### Implemented Formulas (6 modes)
+
+The source code implements six selectable efficiency formulas:
+
+1. `ηZ = Re{ZL}|Z21|² / Re{[Z11(ZL+Z22)-Z12Z21](ZL+Z22)*}` (`z_single`)
+2. `ηZL,Γin=0 = Re{ZL}|Z21|² / Re{[Z11(ZL+Z22)-Z12Z21](ZL+Z22)*}` (`zl_gin0`, default)
+3. `ηABCD = PL / Pin` (`abcd_power`)
+4. `|S21|²·(1−|S22|²) / |1−S22²|²` (`h_squared`)
+5. `|S21|²` (`s21_squared`)
+6. `ηoverall = (1 - |S11|²) × |S21|²` (`overall`)
+
+### Formula Inputs by Mode
+
+- `z_single`: requires `S11`, `S21`, `S12`, `S22` (converted to Z-parameters with `ZL` from `conj(S22)`).
+- `zl_gin0`: requires `S11`, `S21`, `S12`, `S22` (converted to Z-parameters, then `ZL = -Z12·Z21/(50 - Z11) - Z22`).
+- `abcd_power`: requires `S11`, `S21`, `S12`, `S22` (S→Z→ABCD, then `PL/Pin`).
+- `h_squared`: requires `S21`, `S22`.
+- `s21_squared`: requires `S21`.
+- `overall`: requires `S11`, `S21`.
+
+### Important Limitation of the S-Parameter Efficiency Formula
+
+The simplified formula used in this feature,
 
 **η = (1 - |S11|²) × |S21|²**
 
-Where:
-- **η** (eta) = Power transmission efficiency (dimensionless, range [0, 1])
-- **|S11|²** = Magnitude squared of S11 parameter (reflection coefficient)
-- **|S21|²** = Magnitude squared of S21 parameter (forward transmission coefficient)
+is tied to the **50 Ω reference condition** of the network analyzer ports.
 
-### Physical Interpretation
+- In normal VNA measurements, port 1 and port 2 are both 50 Ω systems.
+- S-parameters are therefore defined with respect to that reference impedance.
+- The above simplified efficiency expression is valid for that matched reference condition and is easy to misuse as a universal efficiency formula.
 
-The formula captures two key losses in an RF system:
+Because of this, S-parameter-only efficiency can be misleading if interpreted outside its reference condition. It is best used to evaluate:
 
-1. **(1 - |S11|²)** = Power transmitted into the network
-   - |S11|² represents power reflected back to the source
-   - Subtracting from 1 gives the fraction of power that enters the network
-   - Range: [0, 1], where 1 means no reflection (perfect impedance match)
+1. Matching/mismatching behavior
+2. Relative transmission trends
+3. Efficiency under 50 Ω reference assumptions
 
-2. **|S21|²** = Power transmitted through the network
-   - Represents the transmission efficiency from port 1 to port 2
-   - Range: [0, 1], where 1 means no attenuation
-
-### Result Bounds
-
-Since both components are bounded [0, 1], the product is naturally bounded:
-- **Minimum**: 0 (either all power is reflected or none is transmitted)
-- **Maximum**: 1 (perfect transmission with no reflection)
-
-This natural boundedness eliminates the need for post-calculation normalization.
+For **arbitrary load impedance** efficiency calculation, use the **ABCD-matrix power method** (`ηABCD = PL / Pin`) or the equivalent full Z/ABCD power derivation (`ηZ`) instead of simplified S-only formulas. ABCD/Z-based methods are the proper approach when load is not fixed at 50 Ω.
 
 ## Data Structures
 
 ### Efficiency Display Table
 
-**Function**: `build_efficiency_display_table(df)`
+**Function**: `build_efficiency_display_table(df, efficiency_mode)`
 
-**Input**: 
-- `df` (pandas DataFrame) with S-parameter data columns: S11_r, S11_x, S21_r, S21_x
+**Input**:
+- `df` (pandas DataFrame) with required S-parameter columns based on selected formula mode.
 
 **Output**: 
 - `presentation_rows` (list of dicts) formatted for table display
@@ -58,10 +68,10 @@ This natural boundedness eliminates the need for post-calculation normalization.
 
 ### Smith Chart Efficiency Lookup
 
-**Function**: `build_smith_efficiency_lookup(df)`
+**Function**: `build_smith_efficiency_lookup(df, efficiency_mode="z_single")`
 
-**Input**: 
-- `df` (pandas DataFrame) with S-parameter data columns: S11_r, S11_x, S21_r, S21_x
+**Input**:
+- `df` (pandas DataFrame) with required S-parameter columns based on selected formula mode.
 
 **Output**: 
 - Dictionary mapping `(x_c1, y_c2)` → float (efficiency value)
@@ -286,9 +296,13 @@ norm = Normalize(vmin=poor_threshold, vmax=good_threshold, clip=True)
 
 ### Compatibility Notes
 
-- Requires both S11_r, S11_x, S21_r, S21_x columns in data
+- Required columns depend on formula mode:
+  - `z_single`, `zl_gin0`, `abcd_power`: S11/S21/S12/S22
+  - `h_squared`: S21/S22
+  - `s21_squared`: S21
+  - `overall`: S11/S21
 - Works with both full (200×704) and reduced grid data
-- Smith Chart points use S11 impedance coordinates, colored by S11+S21 efficiency
+- Smith Chart points use S11 impedance coordinates; colors follow the selected efficiency formula mode
 - No dependency on other modes (dz, dgamma) - independent calculation
 
 ## Key Files and Line References
@@ -315,10 +329,11 @@ norm = Normalize(vmin=poor_threshold, vmax=good_threshold, clip=True)
 
 ## Testing Checklist
 
-- [ ] Load CSV with S11 and S21 data
+- [ ] Load CSV with full S-parameter data (S11/S21/S12/S22) for complete formula coverage
 - [ ] Verify Efficiency tab shows correct X-Y grid with values in [0, 1]
 - [ ] Click cell to display value in status label
 - [ ] Switch Smith Chart to Efficiency mode
+- [ ] Switch Efficiency formula dropdown across all 5 modes and verify recalculation
 - [ ] Verify points color-coded by efficiency
 - [ ] Adjust good threshold, verify green colors update
 - [ ] Adjust poor threshold, verify red colors update
@@ -326,7 +341,7 @@ norm = Normalize(vmin=poor_threshold, vmax=good_threshold, clip=True)
 - [ ] Verify validation: threshold range [0, 100]
 - [ ] Test with reduced grid data (sparse positions)
 - [ ] Export CSV and verify efficiency table integrity
-- [ ] Test with missing S21 data (should use viridis fallback)
+- [ ] Test with missing required columns per mode and verify mode-specific validation message
 
 ## Version History
 
