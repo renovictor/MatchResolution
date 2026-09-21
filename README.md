@@ -1,4 +1,4 @@
-# Palantir User Manual (v3.0.1)
+# Palantir User Manual (v3.1.1)
 
 ## 1. What this app does
 
@@ -32,7 +32,7 @@ During conversion, the app can **de-embed cable effects** using Cable1/Cable2 S-
 ### EXE mode (Windows)
 Run:
 ```powershell
-.\dist\Palantir_V3.0.1.exe
+.\dist\Palantir_V3.1.1.exe
 ```
 
 The app opens **maximized** by default, with **Smith Chart** as the selected startup tab.

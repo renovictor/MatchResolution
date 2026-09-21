@@ -8,6 +8,7 @@ from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QEvent, QEventL
 from PySide6.QtGui import QColor, QBrush, QFont, QDoubleValidator, QIcon
 from PySide6.QtWidgets import (
     QApplication,
+    QAbstractItemView,
     QButtonGroup,
     QComboBox,
     QMainWindow,
@@ -42,6 +43,7 @@ REQUIRED_TABLE_COLUMNS = ["Frequency", "CMD", *EXPECTED_S_COLUMNS]
 EXPANDED_CMD_COLUMNS = ["C1_coarse", "C1_fine", "C2_coarse", "C2_fine"]
 FULL_GRID_ROWS = 7 * 64 * 7 * 64
 REDUCED_GRID_ROWS = 7 * 8 * 7 * 8
+CAP_POSITION_MAX = (7 * 64) - 1
 XY_PARAMETERS = ["S11", "S21", "S12", "S22"]
 IMPEDANCE_PARAMETERS = ["S11", "S22"]
 ZPAR_PARAMETERS = ["Z11", "Z21", "Z12", "Z22"]
@@ -1989,6 +1991,78 @@ def build_smith_contour_plot_data(df, parameter_name):
     return points
 
 
+def build_smith_impedance_overlay_data(df, overlay_mode):
+    """
+    Build impedance-based Smith chart overlay points.
+    overlay_mode:
+      - "z_out":      plot Z*out based on S22 (Gamma = S22)
+      - "zl_gin0":    plot ZL,Gamma_in=0 converted back to Gamma
+      - "overlap":    plot both of the above
+    """
+    overlay_points = []
+    if overlay_mode not in {"z_out", "zl_gin0", "overlap"}:
+        return overlay_points
+
+    has_s22 = {"S22_r", "S22_x"}.issubset(set(df.columns))
+    has_full_s = {"S11_r", "S11_x", "S21_r", "S21_x", "S12_r", "S12_x", "S22_r", "S22_x"}.issubset(set(df.columns))
+    if not has_s22 and not has_full_s:
+        return overlay_points
+
+    iter_cols = ["X_C1", "Y_C2", "S11_r", "S11_x", "S21_r", "S21_x", "S12_r", "S12_x", "S22_r", "S22_x"]
+    for row in df[iter_cols].itertuples(index=False):
+        x_pos = int(row[0])
+        y_pos = int(row[1])
+        s11_r, s11_x = row[2], row[3]
+        s21_r, s21_x = row[4], row[5]
+        s12_r, s12_x = row[6], row[7]
+        s22_r, s22_x = row[8], row[9]
+
+        if overlay_mode in {"z_out", "overlap"} and not (pd.isna(s22_r) or pd.isna(s22_x)):
+            gamma_z_out = complex(s22_r, s22_x)
+            impedance_z_out = reflect_to_impedance_value(gamma_z_out.real, gamma_z_out.imag)
+            if impedance_z_out is not None:
+                overlay_points.append({
+                    "x_c1": x_pos,
+                    "y_c2": y_pos,
+                    "gamma": gamma_z_out,
+                    "impedance": impedance_z_out,
+                    "overlay_type": "z_out",
+                })
+
+        if overlay_mode in {"zl_gin0", "overlap"}:
+            required = [s11_r, s11_x, s21_r, s21_x, s12_r, s12_x, s22_r, s22_x]
+            if any(pd.isna(value) for value in required):
+                continue
+            z_values = s_to_z_parameter_values(
+                complex(s11_r, s11_x),
+                complex(s21_r, s21_x),
+                complex(s12_r, s12_x),
+                complex(s22_r, s22_x),
+            )
+            if z_values is None:
+                continue
+            z_load = calculate_zl_gamma_in0_value(
+                z_values["Z11"],
+                z_values["Z12"],
+                z_values["Z21"],
+                z_values["Z22"],
+            )
+            if z_load is None:
+                continue
+            gamma_zl = impedance_to_reflection_value(z_load.real, z_load.imag)
+            if gamma_zl is None:
+                continue
+            overlay_points.append({
+                "x_c1": x_pos,
+                "y_c2": y_pos,
+                "gamma": gamma_zl,
+                "impedance": z_load,
+                "overlay_type": "zl_gin0",
+            })
+
+    return overlay_points
+
+
 def build_smith_dz_lookup(df, z0=DEFAULT_Z0):
     """
     Build a lookup table for Smith-chart dZ coloring.
@@ -2501,9 +2575,15 @@ class MatchResolutionGui(QMainWindow):
         self.smith_dz_lookup = {}
         self.smith_dgamma_lookup = {}
         self.smith_efficiency_lookup = {}
+        self.smith_impedance_overlay_mode = "none"
+        self.smith_impedance_overlay_points = []
         self.efficiency_good_threshold = 1.0
         self.efficiency_poor_threshold = 0.1
         self.current_cable_source = "default (no cable)"
+        self._table_search_controls = []
+        self._table_search_views = []
+        self.table_search_debug_enabled = True
+        self.table_search_debug_path = os.path.join(os.getcwd(), "table_search_debug.log")
 
         self.init_ui()
 
@@ -2793,7 +2873,6 @@ class MatchResolutionGui(QMainWindow):
             }
         """)
         xy_toolbar_layout.addWidget(self.xy_cell_label, stretch=1)
-        xy_toolbar_layout.addStretch(1)
 
         self.xy_table_view = QTableView()
         self.xy_table_view.setAlternatingRowColors(False)
@@ -2812,6 +2891,8 @@ class MatchResolutionGui(QMainWindow):
             }
         """)
         self._enable_table_hover_highlight(self.xy_table_view)
+        self._register_table_search_controls(xy_toolbar_layout, self.xy_table_view, self.xy_cell_label, "xy")
+        xy_toolbar_layout.addStretch(1)
         self.xy_tab = self.create_table_page(self.xy_table_view, xy_toolbar)
         self.tabs.addTab(self.xy_tab, "X-Y Table")
 
@@ -2844,7 +2925,6 @@ class MatchResolutionGui(QMainWindow):
             }
         """)
         phase_toolbar_layout.addWidget(self.phase_cell_label, stretch=1)
-        phase_toolbar_layout.addStretch(1)
 
         self.phase_table_view = QTableView()
         self.phase_table_view.setAlternatingRowColors(False)
@@ -2863,6 +2943,8 @@ class MatchResolutionGui(QMainWindow):
             }
         """)
         self._enable_table_hover_highlight(self.phase_table_view)
+        self._register_table_search_controls(phase_toolbar_layout, self.phase_table_view, self.phase_cell_label, "phase")
+        phase_toolbar_layout.addStretch(1)
         self.phase_tab = self.create_table_page(self.phase_table_view, phase_toolbar)
         self.tabs.addTab(self.phase_tab, "Phase Magnitude")
 
@@ -2948,7 +3030,6 @@ class MatchResolutionGui(QMainWindow):
             }
         """)
         impedance_toolbar_layout.addWidget(self.impedance_cell_label, stretch=1)
-        impedance_toolbar_layout.addStretch(1)
 
         self.impedance_table_view = QTableView()
         self.impedance_table_view.setAlternatingRowColors(False)
@@ -2967,6 +3048,8 @@ class MatchResolutionGui(QMainWindow):
             }
         """)
         self._enable_table_hover_highlight(self.impedance_table_view)
+        self._register_table_search_controls(impedance_toolbar_layout, self.impedance_table_view, self.impedance_cell_label, "impedance")
+        impedance_toolbar_layout.addStretch(1)
         self.impedance_tab = self.create_table_page(self.impedance_table_view, impedance_toolbar)
         self.tabs.addTab(self.impedance_tab, "Z*out")
 
@@ -2992,7 +3075,6 @@ class MatchResolutionGui(QMainWindow):
             }
         """)
         zl_toolbar_layout.addWidget(self.zl_cell_label, stretch=1)
-        zl_toolbar_layout.addStretch(1)
 
         self.zl_table_view = QTableView()
         self.zl_table_view.setAlternatingRowColors(False)
@@ -3011,6 +3093,8 @@ class MatchResolutionGui(QMainWindow):
             }
         """)
         self._enable_table_hover_highlight(self.zl_table_view)
+        self._register_table_search_controls(zl_toolbar_layout, self.zl_table_view, self.zl_cell_label, "zl")
+        zl_toolbar_layout.addStretch(1)
         self.zl_table_page = self.create_table_page(self.zl_table_view, zl_toolbar)
         self.tabs.addTab(self.zl_table_page, "ZL,Γin=0")
 
@@ -3044,7 +3128,6 @@ class MatchResolutionGui(QMainWindow):
             }
         """)
         zpar_toolbar_layout.addWidget(self.zpar_cell_label, stretch=1)
-        zpar_toolbar_layout.addStretch(1)
 
         self.zpar_table_view = QTableView()
         self.zpar_table_view.setAlternatingRowColors(False)
@@ -3063,6 +3146,8 @@ class MatchResolutionGui(QMainWindow):
             }
         """)
         self._enable_table_hover_highlight(self.zpar_table_view)
+        self._register_table_search_controls(zpar_toolbar_layout, self.zpar_table_view, self.zpar_cell_label, "zpar")
+        zpar_toolbar_layout.addStretch(1)
         self.zpar_table_page = self.create_table_page(self.zpar_table_view, zpar_toolbar)
         self.tabs.addTab(self.zpar_table_page, "Zpar")
 
@@ -3096,7 +3181,6 @@ class MatchResolutionGui(QMainWindow):
             }
         """)
         abcd_toolbar_layout.addWidget(self.abcd_cell_label, stretch=1)
-        abcd_toolbar_layout.addStretch(1)
 
         self.abcd_table_view = QTableView()
         self.abcd_table_view.setAlternatingRowColors(False)
@@ -3115,6 +3199,8 @@ class MatchResolutionGui(QMainWindow):
             }
         """)
         self._enable_table_hover_highlight(self.abcd_table_view)
+        self._register_table_search_controls(abcd_toolbar_layout, self.abcd_table_view, self.abcd_cell_label, "abcd")
+        abcd_toolbar_layout.addStretch(1)
         self.abcd_table_page = self.create_table_page(self.abcd_table_view, abcd_toolbar)
         self.tabs.addTab(self.abcd_table_page, "ABCD Matrix")
 
@@ -3148,7 +3234,6 @@ class MatchResolutionGui(QMainWindow):
             }
         """)
         dz_toolbar_layout.addWidget(self.dz_cell_label, stretch=1)
-        dz_toolbar_layout.addStretch(1)
 
         self.dz_table_view = QTableView()
         self.dz_table_view.setAlternatingRowColors(False)
@@ -3168,6 +3253,8 @@ class MatchResolutionGui(QMainWindow):
             }
         """)
         self._enable_table_hover_highlight(self.dz_table_view)
+        self._register_table_search_controls(dz_toolbar_layout, self.dz_table_view, self.dz_cell_label, "dz")
+        dz_toolbar_layout.addStretch(1)
         self.dz_table_page = self.create_table_page(self.dz_table_view, dz_toolbar)
 
         dz_plot_frame = QFrame()
@@ -3277,6 +3364,17 @@ class MatchResolutionGui(QMainWindow):
         parameter_row.addWidget(self.smith_parameter_combo)
         parameter_row.addStretch(1)
         parameter_layout.addLayout(parameter_row)
+        impedance_row = QHBoxLayout()
+        impedance_row.addWidget(QLabel("Impedance:"))
+        self.smith_impedance_overlay_combo = QComboBox()
+        self.smith_impedance_overlay_combo.addItem("None", "none")
+        self.smith_impedance_overlay_combo.addItem("Z*out (S22)", "z_out")
+        self.smith_impedance_overlay_combo.addItem("ZL,Γin=0", "zl_gin0")
+        self.smith_impedance_overlay_combo.addItem("Overlap impedance", "overlap")
+        self.smith_impedance_overlay_combo.currentTextChanged.connect(self.refresh_smith_chart)
+        impedance_row.addWidget(self.smith_impedance_overlay_combo)
+        impedance_row.addStretch(1)
+        parameter_layout.addLayout(impedance_row)
         parameter_layout.addWidget(self.smith_hover_label)
         smith_toolbar_layout.addLayout(parameter_layout)
         button_stack = QVBoxLayout()
@@ -3571,7 +3669,6 @@ class MatchResolutionGui(QMainWindow):
             }
         """)
         reflection_toolbar_layout.addWidget(self.reflection_cell_label, stretch=1)
-        reflection_toolbar_layout.addStretch(1)
 
         self.reflection_table_view = QTableView()
         self.reflection_table_view.setAlternatingRowColors(False)
@@ -3591,6 +3688,8 @@ class MatchResolutionGui(QMainWindow):
             }
         """)
         self._enable_table_hover_highlight(self.reflection_table_view)
+        self._register_table_search_controls(reflection_toolbar_layout, self.reflection_table_view, self.reflection_cell_label, "reflection")
+        reflection_toolbar_layout.addStretch(1)
         self.reflection_table_page = self.create_table_page(self.reflection_table_view, reflection_toolbar)
 
         reflection_plot_frame = QFrame()
@@ -3702,7 +3801,6 @@ class MatchResolutionGui(QMainWindow):
             }
         """)
         efficiency_toolbar_layout.addWidget(self.efficiency_cell_label, stretch=1)
-        efficiency_toolbar_layout.addStretch(1)
 
         self.efficiency_table_view = QTableView()
         self.efficiency_table_view.setAlternatingRowColors(False)
@@ -3722,6 +3820,8 @@ class MatchResolutionGui(QMainWindow):
             }
         """)
         self._enable_table_hover_highlight(self.efficiency_table_view)
+        self._register_table_search_controls(efficiency_toolbar_layout, self.efficiency_table_view, self.efficiency_cell_label, "efficiency")
+        efficiency_toolbar_layout.addStretch(1)
         self.efficiency_table_page = self.create_table_page(self.efficiency_table_view, efficiency_toolbar)
 
         efficiency_plot_frame = QFrame()
@@ -3805,7 +3905,6 @@ class MatchResolutionGui(QMainWindow):
             }
         """)
         iout_toolbar_layout.addWidget(self.iout_cell_label, stretch=1)
-        iout_toolbar_layout.addStretch(1)
 
         self.iout_table_view = QTableView()
         self.iout_table_view.setAlternatingRowColors(False)
@@ -3825,6 +3924,8 @@ class MatchResolutionGui(QMainWindow):
             }
         """)
         self._enable_table_hover_highlight(self.iout_table_view)
+        self._register_table_search_controls(iout_toolbar_layout, self.iout_table_view, self.iout_cell_label, "iout")
+        iout_toolbar_layout.addStretch(1)
         self.iout_table_page = self.create_table_page(self.iout_table_view, iout_toolbar)
         self.iout_tab = QWidget()
         iout_layout = QVBoxLayout(self.iout_tab)
@@ -3868,7 +3969,6 @@ class MatchResolutionGui(QMainWindow):
             }
         """)
         vpp_toolbar_layout.addWidget(self.vpp_cell_label, stretch=1)
-        vpp_toolbar_layout.addStretch(1)
 
         self.vpp_table_view = QTableView()
         self.vpp_table_view.setAlternatingRowColors(False)
@@ -3888,6 +3988,8 @@ class MatchResolutionGui(QMainWindow):
             }
         """)
         self._enable_table_hover_highlight(self.vpp_table_view)
+        self._register_table_search_controls(vpp_toolbar_layout, self.vpp_table_view, self.vpp_cell_label, "vpp")
+        vpp_toolbar_layout.addStretch(1)
         self.vpp_table_page = self.create_table_page(self.vpp_table_view, vpp_toolbar)
         self.vpp_tab = QWidget()
         vpp_layout = QVBoxLayout(self.vpp_tab)
@@ -3923,7 +4025,6 @@ class MatchResolutionGui(QMainWindow):
            }
         """)
         phi_out_toolbar_layout.addWidget(self.phi_out_cell_label, stretch=1)
-        phi_out_toolbar_layout.addStretch(1)
 
         self.phi_out_table_view = QTableView()
         self.phi_out_table_view.setAlternatingRowColors(False)
@@ -3943,6 +4044,8 @@ class MatchResolutionGui(QMainWindow):
            }
         """)
         self._enable_table_hover_highlight(self.phi_out_table_view)
+        self._register_table_search_controls(phi_out_toolbar_layout, self.phi_out_table_view, self.phi_out_cell_label, "phi_out")
+        phi_out_toolbar_layout.addStretch(1)
         self.phi_out_table_page = self.create_table_page(self.phi_out_table_view, phi_out_toolbar)
         self.phi_out_tab = QWidget()
         phi_out_layout = QVBoxLayout(self.phi_out_tab)
@@ -3965,6 +4068,20 @@ class MatchResolutionGui(QMainWindow):
         self.tabs.addTab(self.vpp_tab, "Vpp")
         self.tabs.addTab(self.phi_out_tab, "φ_out")
         self.tabs.addTab(self.derive_eta_formula_tab, "Derive η formula")
+        self._table_search_views = [
+            self.xy_table_view,
+            self.phase_table_view,
+            self.impedance_table_view,
+            self.zl_table_view,
+            self.zpar_table_view,
+            self.abcd_table_view,
+            self.dz_table_view,
+            self.reflection_table_view,
+            self.efficiency_table_view,
+            self.iout_table_view,
+            self.vpp_table_view,
+            self.phi_out_table_view,
+        ]
         self.tabs.setCurrentWidget(self.smith_tab)
         self._startup_status("Preparing Smith chart and plots...", 75)
 
@@ -4339,9 +4456,247 @@ class MatchResolutionGui(QMainWindow):
         layout.addWidget(table_view, stretch=1)
         return page
 
+    def _register_table_search_controls(self, toolbar_layout, table_view, cell_label, tab_key):
+        c1_edit = QLineEdit()
+        c1_edit.setFixedWidth(62)
+        c1_edit.setPlaceholderText("0-100")
+        c1_edit.setValidator(QDoubleValidator(0.0, 100.0, 2))
+
+        c2_edit = QLineEdit()
+        c2_edit.setFixedWidth(62)
+        c2_edit.setPlaceholderText("0-100")
+        c2_edit.setValidator(QDoubleValidator(0.0, 100.0, 2))
+
+        apply_button = QPushButton("Apply")
+        apply_button.setMinimumWidth(72)
+        apply_button.clicked.connect(lambda _checked=False, key=tab_key: self._apply_table_search(key))
+        c1_edit.returnPressed.connect(lambda key=tab_key: self._apply_table_search(key))
+        c2_edit.returnPressed.connect(lambda key=tab_key: self._apply_table_search(key))
+
+        toolbar_layout.addWidget(QLabel("C1%"))
+        toolbar_layout.addWidget(c1_edit)
+        toolbar_layout.addWidget(QLabel("C2%"))
+        toolbar_layout.addWidget(c2_edit)
+        toolbar_layout.addWidget(apply_button)
+
+        self._table_search_controls.append(
+            {
+                "tab_key": tab_key,
+                "table_view": table_view,
+                "cell_label": cell_label,
+                "c1_edit": c1_edit,
+                "c2_edit": c2_edit,
+            }
+        )
+
+    def _get_table_search_control(self, tab_key):
+        for control in self._table_search_controls:
+            if control["tab_key"] == tab_key:
+                return control
+        return None
+
+    def _sync_table_search_inputs(self, c1_text, c2_text):
+        for control in self._table_search_controls:
+            control["c1_edit"].setText(c1_text)
+            control["c2_edit"].setText(c2_text)
+
+    def _find_table_search_target(self, c1_pct, c2_pct):
+        if self.df_all is None or self.df_all.empty:
+            raise ValueError("Please convert data before searching.")
+
+        x_values, y_values = extract_xy_axis_values(self.df_all)
+        c1_ratio = c1_pct / 100.0
+        c2_ratio = c2_pct / 100.0
+        target_x_position = c1_ratio * CAP_POSITION_MAX
+        target_y_position = c2_ratio * CAP_POSITION_MAX
+
+        x_index = min(range(len(x_values)), key=lambda idx: abs(float(x_values[idx]) - target_x_position))
+        y_index = min(range(len(y_values)), key=lambda idx: abs(float(y_values[idx]) - target_y_position))
+
+        matched_x_value = x_values[x_index]
+        matched_y_value = y_values[y_index]
+        matched_x_pct = (float(matched_x_value) / CAP_POSITION_MAX) * 100.0
+        matched_y_pct = (float(matched_y_value) / CAP_POSITION_MAX) * 100.0
+
+        x_steps = sorted({x_values[i + 1] - x_values[i] for i in range(len(x_values) - 1)}) if len(x_values) > 1 else [0]
+        y_steps = sorted({y_values[i + 1] - y_values[i] for i in range(len(y_values) - 1)}) if len(y_values) > 1 else [0]
+        x_window_start = max(0, x_index - 2)
+        x_window_end = min(len(x_values), x_index + 3)
+        y_window_start = max(0, y_index - 2)
+        y_window_end = min(len(y_values), y_index + 3)
+        x_nearby = [
+            {
+                "position": int(position_value),
+                "pct": float(position_value / CAP_POSITION_MAX * 100.0),
+            }
+            for position_value in x_values[x_window_start:x_window_end]
+        ]
+        y_nearby = [
+            {
+                "position": int(position_value),
+                "pct": float(position_value / CAP_POSITION_MAX * 100.0),
+            }
+            for position_value in y_values[y_window_start:y_window_end]
+        ]
+
+        row_index = y_index + 3
+        col_index = x_index + 3
+        exact_match = abs(matched_x_pct - c1_pct) < 1e-12 and abs(matched_y_pct - c2_pct) < 1e-12
+        distance = float(np.sqrt((matched_x_pct - c1_pct) ** 2 + (matched_y_pct - c2_pct) ** 2))
+        result = {
+            "requested_c1_pct": float(c1_pct),
+            "requested_c2_pct": float(c2_pct),
+            "x_c1": int(matched_x_value),
+            "y_c2": int(matched_y_value),
+            "x_c1_pct": float(matched_x_pct),
+            "y_c2_pct": float(matched_y_pct),
+            "distance": distance,
+            "exact_match": exact_match,
+            "target_x_position": float(target_x_position),
+            "target_y_position": float(target_y_position),
+            "x_axis_count": len(x_values),
+            "y_axis_count": len(y_values),
+            "x_axis_min": int(x_values[0]),
+            "y_axis_min": int(y_values[0]),
+            "x_axis_max": int(x_values[-1]),
+            "y_axis_max": int(y_values[-1]),
+            "x_axis_steps": [int(step) for step in x_steps],
+            "y_axis_steps": [int(step) for step in y_steps],
+            "x_axis_nearby": x_nearby,
+            "y_axis_nearby": y_nearby,
+        }
+        return row_index, col_index, result
+
+    def _append_table_search_debug_log(self, tab_key, input_c1_text, input_c2_text, result, scroll_debug=None):
+        if not self.table_search_debug_enabled:
+            return
+
+        try:
+            with open(self.table_search_debug_path, "a", encoding="utf-8") as debug_file:
+                debug_file.write(
+                    "[TableSearchDebug] "
+                    f"tab={tab_key} "
+                    f"input_text=({input_c1_text},{input_c2_text}) "
+                    f"parsed_pct=({result['requested_c1_pct']:.6f},{result['requested_c2_pct']:.6f}) "
+                    f"target_pos=({result['target_x_position']:.6f},{result['target_y_position']:.6f}) "
+                    f"matched_pos=({result['x_c1']},{result['y_c2']}) "
+                    f"matched_pct=({result['x_c1_pct']:.6f},{result['y_c2_pct']:.6f}) "
+                    f"x_axis=count:{result['x_axis_count']} min:{result['x_axis_min']} max:{result['x_axis_max']} steps:{result['x_axis_steps']} nearby:{result['x_axis_nearby']} "
+                    f"y_axis=count:{result['y_axis_count']} min:{result['y_axis_min']} max:{result['y_axis_max']} steps:{result['y_axis_steps']} nearby:{result['y_axis_nearby']} "
+                    f"distance={result['distance']:.6f} "
+                    f"scroll={scroll_debug}\n"
+                )
+        except OSError:
+            pass
+
+    def _scroll_table_cell_to_top_left(self, table_view, row_index, col_index):
+        model = table_view.model()
+        if model is None:
+            return None
+        if row_index < 0 or col_index < 0 or row_index >= model.rowCount() or col_index >= model.columnCount():
+            return None
+
+        index = model.index(row_index, col_index)
+        if not index.isValid():
+            return None
+
+        table_view.setCurrentIndex(index)
+        table_view.scrollTo(index, QAbstractItemView.PositionAtCenter)
+
+        frozen_cols = 0
+        frozen_rows = 0
+        pane = getattr(self, "_freeze_panes", {}).get(table_view)
+        if pane is not None:
+            frozen_cols = min(pane["freeze_cols"], model.columnCount())
+            frozen_rows = min(pane["freeze_rows"], model.rowCount())
+
+        if col_index <= frozen_cols:
+            target_h = 0
+        else:
+            if table_view.horizontalScrollMode() == QAbstractItemView.ScrollPerItem:
+                target_h = col_index - frozen_cols
+            else:
+                target_h = 0
+                for col in range(frozen_cols, col_index):
+                    target_h += table_view.columnWidth(col)
+
+        if row_index <= frozen_rows:
+            target_v = 0
+        else:
+            if table_view.verticalScrollMode() == QAbstractItemView.ScrollPerItem:
+                target_v = row_index - frozen_rows
+            else:
+                target_v = 0
+                for row in range(frozen_rows, row_index):
+                    target_v += table_view.rowHeight(row)
+
+        hbar = table_view.horizontalScrollBar()
+        vbar = table_view.verticalScrollBar()
+        hbar.setValue(max(hbar.minimum(), min(target_h, hbar.maximum())))
+        vbar.setValue(max(vbar.minimum(), min(target_v, vbar.maximum())))
+
+        if pane is not None:
+            pane["top"].horizontalScrollBar().setValue(hbar.value())
+            pane["left"].verticalScrollBar().setValue(vbar.value())
+            self._update_frozen_pane_geometry(table_view)
+
+        return {
+            "target_h": int(target_h),
+            "target_v": int(target_v),
+            "actual_h": int(hbar.value()),
+            "actual_v": int(vbar.value()),
+            "row_index": int(row_index),
+            "col_index": int(col_index),
+        }
+
+    def _apply_table_search(self, source_tab_key):
+        control = self._get_table_search_control(source_tab_key)
+        if control is None:
+            return
+
+        c1_text_raw = control["c1_edit"].text().strip()
+        c2_text_raw = control["c2_edit"].text().strip()
+        try:
+            c1_pct = float(c1_text_raw)
+            c2_pct = float(c2_text_raw)
+        except ValueError:
+            QMessageBox.warning(self, "Input Error", "Please enter numeric C1% and C2% values.")
+            return
+
+        if c1_pct < 0 or c1_pct > 100 or c2_pct < 0 or c2_pct > 100:
+            QMessageBox.warning(self, "Input Error", "Please enter C1% and C2% between 0 and 100.")
+            return
+
+        try:
+            row_index, col_index, result = self._find_table_search_target(c1_pct, c2_pct)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Search Error", str(exc))
+            return
+
+        c1_text = f"{c1_pct:.2f}".rstrip("0").rstrip(".")
+        c2_text = f"{c2_pct:.2f}".rstrip("0").rstrip(".")
+        self._sync_table_search_inputs(c1_text, c2_text)
+
+        scroll_debug = {}
+        for table_view in self._table_search_views:
+            debug_result = self._scroll_table_cell_to_top_left(table_view, row_index, col_index)
+            if debug_result is not None:
+                scroll_debug[hex(id(table_view))] = debug_result
+
+        self._append_table_search_debug_log(source_tab_key, c1_text_raw, c2_text_raw, result, scroll_debug=scroll_debug)
+        match_text = "exact" if result["exact_match"] else "nearest"
+        control["cell_label"].setText(
+            f"{match_text} match: C1 {result['x_c1_pct']:.2f}% (pos {result['x_c1']}), "
+            f"C2 {result['y_c2_pct']:.2f}% (pos {result['y_c2']}) moved to top-left. "
+            f"Target pos=({result['target_x_position']:.3f}, {result['target_y_position']:.3f}). "
+            f"Debug log: {self.table_search_debug_path}"
+        )
+
     def _enable_table_hover_highlight(self, table_view: QTableView):
         table_view.setMouseTracking(True)
         table_view.viewport().setMouseTracking(True)
+        table_view.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        table_view.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         hover_rule = "QTableView::item:hover { background-color: #BBDEFB; color: #0D47A1; }"
         style = table_view.styleSheet()
         if hover_rule not in style:
@@ -4413,6 +4768,8 @@ class MatchResolutionGui(QMainWindow):
         overlay_view = QTableView(parent_view)
         overlay_view.setAlternatingRowColors(False)
         overlay_view.setStyleSheet(parent_view.styleSheet())
+        overlay_view.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        overlay_view.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         overlay_view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         overlay_view.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         overlay_view.setFocusPolicy(Qt.NoFocus)
@@ -5393,6 +5750,7 @@ class MatchResolutionGui(QMainWindow):
     def refresh_smith_chart(self):
         if self.df_all is None or self.df_all.empty:
             self.df_smith_points = []
+            self.smith_impedance_overlay_points = []
             self.smith_plot_points = []
             self.smith_plot_values = np.array([], dtype=complex)
             if _MATPLOTLIB_OK:
@@ -5400,6 +5758,7 @@ class MatchResolutionGui(QMainWindow):
             return
 
         self.current_smith_parameter = self.smith_parameter_combo.currentText().strip()
+        self.smith_impedance_overlay_mode = self.smith_impedance_overlay_combo.currentData() if hasattr(self, "smith_impedance_overlay_combo") else "none"
         if self.current_smith_mode == "contour":
             self.df_smith_points = build_smith_contour_plot_data(self.df_all, self.current_smith_parameter)
             self.smith_dz_lookup = {}
@@ -5420,6 +5779,11 @@ class MatchResolutionGui(QMainWindow):
             else:
                 self.smith_dgamma_lookup = {}
             self.smith_efficiency_lookup = build_smith_efficiency_lookup(self.df_all, self.current_efficiency_mode)
+
+        self.smith_impedance_overlay_points = build_smith_impedance_overlay_data(
+            self.df_all,
+            self.smith_impedance_overlay_mode,
+        )
 
         if self.current_smith_mode == "contour":
             contour_count = max(len(self.df_smith_points) - 1, 0)
@@ -5470,6 +5834,15 @@ class MatchResolutionGui(QMainWindow):
             self.smith_status_label.setText(
                 f"{self.current_smith_parameter}: {len(self.df_smith_points):,} points"
             )
+
+        if self.smith_impedance_overlay_mode != "none":
+            overlay_count = len(self.smith_impedance_overlay_points)
+            overlay_label = {
+                "z_out": "Z*out(S22)",
+                "zl_gin0": "ZL,Γin=0",
+                "overlap": "Overlap impedance",
+            }.get(self.smith_impedance_overlay_mode, self.smith_impedance_overlay_mode)
+            self.smith_status_label.setText(f"{self.smith_status_label.text()} | overlay {overlay_label}: {overlay_count:,} points")
 
         self._draw_smith_chart(self.df_smith_points, self.current_smith_parameter)
 
@@ -5885,6 +6258,48 @@ class MatchResolutionGui(QMainWindow):
             self.smith_plot_values = np.array([], dtype=complex)
             self.smith_plot_points = []
             self.smith_scatter = None
+
+        overlay_points = self.smith_impedance_overlay_points or []
+        if overlay_points:
+            overlay_types = [point.get("overlay_type") for point in overlay_points]
+
+            if any(kind == "z_out" for kind in overlay_types):
+                z_out_mask = np.array([kind == "z_out" for kind in overlay_types], dtype=bool)
+                z_out_values = np.array([point["gamma"] for point in overlay_points], dtype=complex)[z_out_mask]
+                if self.smith_conjugate_button.isChecked():
+                    z_out_values = np.conjugate(z_out_values)
+                if z_out_values.size > 0:
+                    ax.scatter(
+                        z_out_values.real,
+                        z_out_values.imag,
+                        marker="o",
+                        s=10,
+                        c="#1E88E5",
+                        alpha=0.7,
+                        edgecolors="none",
+                        zorder=3,
+                        label="Z*out (S22)",
+                    )
+
+            if any(kind == "zl_gin0" for kind in overlay_types):
+                zl_mask = np.array([kind == "zl_gin0" for kind in overlay_types], dtype=bool)
+                # Keep ZL,Gamma_in=0 overlay non-conjugated regardless of the Conjugate toggle.
+                zl_values = np.array([point["gamma"] for point in overlay_points], dtype=complex)[zl_mask]
+                if zl_values.size > 0:
+                    ax.scatter(
+                        zl_values.real,
+                        zl_values.imag,
+                        marker="x",
+                        s=16,
+                        c="#E53935",
+                        alpha=0.75,
+                        linewidths=0.7,
+                        zorder=3,
+                        label="ZL,Γin=0",
+                    )
+
+            if self.smith_impedance_overlay_mode == "overlap":
+                ax.legend(loc="lower left", fontsize=8, frameon=True)
 
         manual_points = self.smith_manual_points or []
         if manual_points:
